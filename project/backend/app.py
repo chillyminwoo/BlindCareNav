@@ -1,32 +1,39 @@
+import asyncio
+import json
+import os
+import time
 from datetime import datetime, timezone
 from math import asin, atan2, cos, degrees, radians, sin, sqrt
 from pathlib import Path
-import json
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+try:
+    import cv2
+    import numpy as np
+    from ultralytics import YOLO
+except Exception:
+    cv2 = None
+    np = None
+    YOLO = None
 
 
-app = FastAPI(title="A-eye MVP API")
+app = FastAPI(title="A-eye BlindCareNav backend API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://127.0.0.1:5175",
-    ],
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DATA_DIR = Path(__file__).parent / "data"
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+MODEL_PATH = BASE_DIR / "yolo11n.pt"
 
 TACTILE_FILES = {
     "hwagok": "tactile_blocks_hwagok.geojson",
@@ -55,6 +62,29 @@ RISK_LABELS = {
     "crossing": "횡단보도 진입부",
 }
 
+KOREAN_OBJECT_LABELS = {
+    "person": "사람",
+    "car": "차량",
+    "truck": "차량",
+    "bus": "버스",
+    "bicycle": "자전거",
+    "motorcycle": "오토바이",
+    "bench": "벤치",
+    "chair": "의자",
+    "backpack": "가방",
+    "handbag": "가방",
+    "suitcase": "캐리어",
+    "umbrella": "우산",
+    "bottle": "병",
+    "cup": "컵",
+}
+
+STREAM_RISK_LABELS = set(KOREAN_OBJECT_LABELS.keys())
+latest_processed_frame = None
+last_tts_time = 0.0
+tts_cooldown_second = 4.0
+yolo_model = None
+
 
 class Location(BaseModel):
     lat: float
@@ -70,7 +100,7 @@ class PlaceSearchRequest(BaseModel):
 class GuidanceRequest(BaseModel):
     currentLocation: Location | None = None
     nextStep: dict | None = None
-    risks: list[dict] = []
+    risks: list[dict] = Field(default_factory=list)
 
 
 class MobileRouteRequest(BaseModel):
@@ -101,7 +131,7 @@ class MobileDetectionRequest(BaseModel):
     lat: float
     lng: float
     heading: float | None = None
-    detections: list[DetectionItem] = []
+    detections: list[DetectionItem] = Field(default_factory=list)
     message: str = ""
 
 
@@ -321,9 +351,67 @@ def build_mobile_route_response(area: str, keyword: str, current_location: Locat
     }
 
 
-@app.get("/")
+def get_yolo_model():
+    global yolo_model
+
+    if YOLO is None or cv2 is None or np is None:
+        raise RuntimeError("YOLO stream dependencies are not installed.")
+
+    if not MODEL_PATH.exists():
+        raise RuntimeError(f"Model file not found: {MODEL_PATH}")
+
+    if yolo_model is None:
+        yolo_model = YOLO(str(MODEL_PATH))
+
+    return yolo_model
+
+
+def build_stream_alert(results, model) -> str | None:
+    detected_classes = []
+
+    for box in results[0].boxes:
+        cls_id = int(box.cls[0])
+        cls_name = model.names[cls_id]
+
+        if cls_name in STREAM_RISK_LABELS:
+            detected_classes.append(KOREAN_OBJECT_LABELS.get(cls_name, cls_name))
+
+    if not detected_classes:
+        return None
+
+    unique_targets = list(dict.fromkeys(detected_classes))
+    return f"전방에 {' 및 '.join(unique_targets)}이 감지되었습니다."
+
+
+async def generate_frames():
+    global latest_processed_frame
+
+    while True:
+        if latest_processed_frame is not None:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + latest_processed_frame + b"\r\n"
+            )
+
+        await asyncio.sleep(0.05)
+
+
+@app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "dataDir": str(DATA_DIR),
+        "yoloReady": YOLO is not None and MODEL_PATH.exists(),
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "BlindCareNav backend",
+        "health": "/api/health",
+        "adminSummary": "/api/admin/summary?area=hwagok",
+    }
 
 
 @app.get("/api/tactile-blocks")
@@ -344,9 +432,7 @@ def get_nearby(
     type: str | None = None,
 ):
     nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
-    log_path = detection_log_path(area)
     place_type = normalize_keyword(type or "")
-
     items = nearby_data.get("items", [])
 
     if place_type and place_type != "all":
@@ -365,7 +451,6 @@ def create_guidance(payload: GuidanceRequest):
     next_step = payload.nextStep or {}
     distance_meter = next_step.get("distanceMeter")
     direction = DIRECTION_LABELS.get(next_step.get("direction"), next_step.get("direction"))
-
     phrases = []
 
     if distance_meter and direction:
@@ -392,10 +477,7 @@ def create_guidance(payload: GuidanceRequest):
         else:
             phrases.append(f"주변에 {risk_label}이 있습니다.")
 
-    return {
-        "message": " ".join(phrases),
-        "level": level,
-    }
+    return {"message": " ".join(phrases), "level": level}
 
 
 @app.post("/api/mobile/route")
@@ -412,15 +494,14 @@ def get_admin_summary(area: str = "hwagok"):
     tactile_data = load_area_json(area, TACTILE_FILES, "점자블록 GeoJSON")
     risk_data = load_area_json(area, RISK_FILES, "위험 지점 JSON")
     nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
+    log_path = detection_log_path(area)
 
     tactile_features = tactile_data.get("features", [])
     risks = risk_data.get("items", [])
     places = nearby_data.get("items", [])
-
     open_risks = [risk for risk in risks if risk.get("status") == "open"]
     resolved_risks = [risk for risk in risks if risk.get("status") == "resolved"]
     danger_risks = [risk for risk in risks if risk.get("level") == "danger"]
-    log_path = detection_log_path(area)
     detection_log_count = 0
 
     if log_path.exists():
@@ -457,11 +538,7 @@ def search_places(payload: PlaceSearchRequest):
         for item in items[:8]
     ]
 
-    return {
-        "area": payload.area,
-        "keyword": payload.keyword,
-        "candidates": candidates,
-    }
+    return {"area": payload.area, "keyword": payload.keyword, "candidates": candidates}
 
 
 @app.post("/api/mobile/emergency")
@@ -559,15 +636,66 @@ def get_admin_detections(area: str = "hwagok", limit: int = 50):
         return {"area": area, "items": []}
 
     with log_path.open("r", encoding="utf-8") as log_file:
-        rows = [
-            json.loads(line)
-            for line in log_file
-            if line.strip()
-        ]
+        rows = [json.loads(line) for line in log_file if line.strip()]
 
     safe_limit = max(1, min(limit, 200))
+    return {"area": area, "items": list(reversed(rows[-safe_limit:]))}
 
-    return {
-        "area": area,
-        "items": list(reversed(rows[-safe_limit:])),
-    }
+
+@app.get("/video_feed")
+async def video_feed():
+    if YOLO is None or cv2 is None or np is None:
+        raise HTTPException(status_code=503, detail="YOLO stream dependencies are not installed.")
+
+    return StreamingResponse(
+        generate_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.websocket("/ws/stream")
+async def websocket_endpoint(websocket: WebSocket):
+    global latest_processed_frame, last_tts_time
+    await websocket.accept()
+
+    try:
+        model = get_yolo_model()
+    except Exception as error:
+        await websocket.send_text(f"YOLO 서버 준비 실패: {error}")
+        await websocket.close()
+        return
+
+    print("[mobile-stream] smartphone camera connected")
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            nparr = np.frombuffer(data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                continue
+
+            results = model(frame, verbose=False)
+            annotated_frame = results[0].plot()
+            current_time = time.time()
+
+            if current_time - last_tts_time > tts_cooldown_second:
+                alert_msg = build_stream_alert(results, model)
+
+                if alert_msg:
+                    await websocket.send_text(alert_msg)
+                    last_tts_time = current_time
+
+            _, buffer = cv2.imencode(".jpg", annotated_frame)
+            latest_processed_frame = buffer.tobytes()
+    except WebSocketDisconnect:
+        print("[mobile-stream] smartphone camera disconnected")
+    except Exception as error:
+        print(f"[mobile-stream] processing error: {error}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

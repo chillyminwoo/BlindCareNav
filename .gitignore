@@ -6,7 +6,7 @@
 # Logs and runtime output
 *.log
 logs/
-vite-project/**/data/*_logs_*.jsonl
+project/**/data/*_logs_*.jsonl
 
 # Python
 __pycache__/

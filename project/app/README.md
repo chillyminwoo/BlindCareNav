@@ -39,12 +39,12 @@ output: [1, 84, 8400] float32
 
 ## Build
 
-Open `native-app` in Android Studio and run the `app` configuration.
+Open `project/app` in Android Studio and run the `app` configuration.
 
 Command-line build on this PC:
 
 ```powershell
-cd C:\Users\KCCISTC\khs_project_blindNav\vite-project\native-app
+cd C:\Users\KCCISTC\khs_project_blindNav\project\app
 $env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
 & 'C:\Users\KCCISTC\.gradle\wrapper\dists\gradle-8.14.3-all\10utluxaxniiv4wxiphsi49nj\gradle-8.14.3\bin\gradle.bat' :app:assembleDebug --no-daemon
 ```
@@ -85,7 +85,7 @@ POST /api/mobile/detections
 The backend stores JSONL logs in:
 
 ```text
-backend/data/mobile_detection_logs_hwagok.jsonl
+project/backend/data/mobile_detection_logs_hwagok.jsonl
 ```
 
 You can inspect recent detections with:
