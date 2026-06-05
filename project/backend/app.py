@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from math import asin, atan2, cos, degrees, radians, sin, sqrt
@@ -226,6 +227,36 @@ def compact_keyword(value: str) -> str:
     return "".join(normalize_keyword(value).split())
 
 
+def clean_destination_keyword(value: str) -> str:
+    text = normalize_keyword(value)
+    removable_phrases = [
+        "안내해줘",
+        "안내해 줘",
+        "안내 해줘",
+        "안내 해 줘",
+        "안내해 주세요",
+        "안내해",
+        "길 안내해줘",
+        "길 안내해 줘",
+        "길 안내",
+        "경로 안내",
+        "경로 찾아줘",
+        "경로 찾아 줘",
+        "찾아줘",
+        "찾아 줘",
+        "가줘",
+        "가 줘",
+        "가자",
+    ]
+
+    for phrase in removable_phrases:
+        text = text.replace(phrase, " ")
+
+    text = re.sub(r"\s+(으로|로)\s*$", " ", text)
+    text = re.sub(r"(으로|로)\s*$", " ", text)
+    return " ".join(text.split())
+
+
 def place_matches_keyword(place: dict, keyword: str) -> bool:
     if not keyword:
         return True
@@ -265,7 +296,9 @@ def find_place_candidates(area: str, keyword: str, current_location: Location | 
 
 
 def build_mobile_route_response(area: str, keyword: str, current_location: Location | None):
-    if not normalize_keyword(keyword):
+    cleaned_keyword = clean_destination_keyword(keyword)
+
+    if not cleaned_keyword:
         fallback_places = find_place_candidates(area, "", current_location)[:3]
         return {
             "ok": False,
@@ -281,7 +314,7 @@ def build_mobile_route_response(area: str, keyword: str, current_location: Locat
             ],
         }
 
-    candidates = find_place_candidates(area, keyword, current_location)
+    candidates = find_place_candidates(area, cleaned_keyword, current_location)
 
     if not candidates:
         fallback_places = find_place_candidates(area, "", current_location)[:3]
@@ -321,7 +354,7 @@ def build_mobile_route_response(area: str, keyword: str, current_location: Locat
     return {
         "ok": True,
         "area": area,
-        "keyword": keyword,
+        "keyword": cleaned_keyword,
         "destination": {
             "id": destination["id"],
             "name": destination["name"],

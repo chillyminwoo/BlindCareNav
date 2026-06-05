@@ -97,14 +97,21 @@ public class VoiceCommandParser {
         String result = raw == null ? "" : raw.trim();
         String[] removablePhrases = {
                 "안내해줘",
+                "안내해 줘",
+                "안내 해줘",
+                "안내 해 줘",
                 "안내해 주세요",
                 "안내해",
                 "길 안내해줘",
+                "길 안내해 줘",
                 "길 안내",
                 "경로 안내",
                 "경로 찾아줘",
+                "경로 찾아 줘",
                 "찾아줘",
+                "찾아 줘",
                 "가줘",
+                "가 줘",
                 "가자",
                 "으로",
                 "로"
