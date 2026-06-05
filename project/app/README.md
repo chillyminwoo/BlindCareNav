@@ -11,6 +11,26 @@ Android native camera + YOLO demo app for the A-eye MVP.
 - Lets the phone test connectivity to the A-eye FastAPI server.
 - Posts obstacle detection events to the FastAPI server with GPS and heading.
 
+## Voice-First Demo Flow
+
+On launch, the app speaks a short prompt and opens Android speech recognition. The current implementation is rule-based first, with `LocalLlmInterpreter` left as the replacement point for a future on-device LLM.
+
+Try commands such as:
+
+```text
+화곡역 3번 출구로 안내해줘
+다시 안내
+다음 안내
+주변 편의점
+주변 화장실
+위험 정보
+현재 위치
+긴급 연락
+안내 종료
+설정 열어
+즐겨찾기
+```
+
 ## Current Demo Model
 
 `app/src/main/assets/yolov8n_coco80_float32.tflite`

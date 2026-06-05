@@ -8,6 +8,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
@@ -50,7 +51,7 @@ public class ServerClient {
                 connection.setRequestMethod("GET");
                 connection.setConnectTimeout(5000);
                 connection.setReadTimeout(5000);
-                connection.setRequestProperty("bypass-tunnel-reminder", "true");
+                setTunnelHeaders(connection);
 
                 int status = connection.getResponseCode();
                 BufferedReader reader = new BufferedReader(new InputStreamReader(
@@ -104,7 +105,7 @@ public class ServerClient {
                 connection.setReadTimeout(4000);
                 connection.setDoOutput(true);
                 connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                connection.setRequestProperty("bypass-tunnel-reminder", "true");
+                setTunnelHeaders(connection);
 
                 JSONObject payload = new JSONObject();
                 payload.put("area", "hwagok");
@@ -176,7 +177,7 @@ public class ServerClient {
                 connection.setReadTimeout(4000);
                 connection.setDoOutput(true);
                 connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                connection.setRequestProperty("bypass-tunnel-reminder", "true");
+                setTunnelHeaders(connection);
 
                 JSONObject payload = new JSONObject();
                 JSONObject currentLocation = new JSONObject();
@@ -248,7 +249,7 @@ public class ServerClient {
                 connection.setReadTimeout(5000);
                 connection.setDoOutput(true);
                 connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                connection.setRequestProperty("bypass-tunnel-reminder", "true");
+                setTunnelHeaders(connection);
 
                 JSONObject currentLocation = new JSONObject();
                 currentLocation.put("lat", lat);
@@ -337,6 +338,177 @@ public class ServerClient {
         }).start();
     }
 
+    public static void requestNearby(
+            String baseUrl,
+            double lat,
+            double lng,
+            String type,
+            Callback callback
+    ) {
+        new Thread(() -> {
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                callback.onResult("서버 주소가 비어 있어 주변시설을 확인하지 못했습니다.");
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                String query = "/api/nearby?area=hwagok"
+                        + "&lat=" + lat
+                        + "&lng=" + lng;
+
+                if (type != null && !type.trim().isEmpty()) {
+                    query += "&type=" + URLEncoder.encode(type.trim(), StandardCharsets.UTF_8.toString());
+                }
+
+                URL url = new URL(normalizedUrl + query);
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("GET");
+                connection.setConnectTimeout(5000);
+                connection.setReadTimeout(5000);
+                setTunnelHeaders(connection);
+
+                int status = connection.getResponseCode();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        status >= 200 && status < 300
+                                ? connection.getInputStream()
+                                : connection.getErrorStream(),
+                        StandardCharsets.UTF_8
+                ));
+                String responseBody = reader.readLine();
+
+                if (status < 200 || status >= 300 || responseBody == null) {
+                    callback.onResult("주변시설 정보를 가져오지 못했습니다. HTTP " + status);
+                    return;
+                }
+
+                JSONObject response = new JSONObject(responseBody);
+                JSONArray items = response.optJSONArray("items");
+
+                if (items == null || items.length() == 0) {
+                    callback.onResult("현재 위치 주변에서 해당 시설을 찾지 못했습니다.");
+                    return;
+                }
+
+                StringBuilder message = new StringBuilder("가까운 주변시설입니다. ");
+                int count = Math.min(3, items.length());
+
+                for (int index = 0; index < count; index += 1) {
+                    JSONObject item = items.optJSONObject(index);
+
+                    if (item == null) {
+                        continue;
+                    }
+
+                    if (index > 0) {
+                        message.append(". ");
+                    }
+
+                    message.append(index + 1)
+                            .append("번 ")
+                            .append(item.optString("name", "이름 없는 시설"))
+                            .append(", 약 ")
+                            .append(item.optInt("distanceMeter", 0))
+                            .append("미터");
+                }
+
+                callback.onResult(message.toString());
+            } catch (Exception error) {
+                callback.onResult("주변시설 정보 확인에 실패했습니다. " + error.getMessage());
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
+    public static void requestRisks(String baseUrl, Callback callback) {
+        new Thread(() -> {
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                callback.onResult("서버 주소가 비어 있어 위험 정보를 확인하지 못했습니다.");
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                URL url = new URL(normalizedUrl + "/api/risks?area=hwagok");
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("GET");
+                connection.setConnectTimeout(5000);
+                connection.setReadTimeout(5000);
+                setTunnelHeaders(connection);
+
+                int status = connection.getResponseCode();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        status >= 200 && status < 300
+                                ? connection.getInputStream()
+                                : connection.getErrorStream(),
+                        StandardCharsets.UTF_8
+                ));
+                String responseBody = reader.readLine();
+
+                if (status < 200 || status >= 300 || responseBody == null) {
+                    callback.onResult("위험 정보를 가져오지 못했습니다. HTTP " + status);
+                    return;
+                }
+
+                JSONObject response = new JSONObject(responseBody);
+                JSONArray items = response.optJSONArray("items");
+
+                if (items == null || items.length() == 0) {
+                    callback.onResult("현재 시범 구역에 등록된 위험 정보가 없습니다.");
+                    return;
+                }
+
+                StringBuilder message = new StringBuilder("화곡 시범 구역 위험 정보입니다. ");
+                int spokenCount = 0;
+
+                for (int index = 0; index < items.length() && spokenCount < 3; index += 1) {
+                    JSONObject item = items.optJSONObject(index);
+
+                    if (item == null) {
+                        continue;
+                    }
+
+                    if ("resolved".equals(item.optString("status", ""))) {
+                        continue;
+                    }
+
+                    if (spokenCount > 0) {
+                        message.append(". ");
+                    }
+
+                    message.append(spokenCount + 1)
+                            .append("번 ")
+                            .append(item.optString("title", "위험 지점"))
+                            .append(", ")
+                            .append(item.optString("level", "주의"));
+                    spokenCount += 1;
+                }
+
+                if (spokenCount == 0) {
+                    callback.onResult("현재 열려 있는 위험 지점은 없습니다.");
+                    return;
+                }
+
+                callback.onResult(message.toString());
+            } catch (Exception error) {
+                callback.onResult("위험 정보 확인에 실패했습니다. " + error.getMessage());
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
     public static void postEmergency(
             String baseUrl,
             String deviceId,
@@ -364,7 +536,7 @@ public class ServerClient {
                 connection.setReadTimeout(4000);
                 connection.setDoOutput(true);
                 connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                connection.setRequestProperty("bypass-tunnel-reminder", "true");
+                setTunnelHeaders(connection);
 
                 JSONObject payload = new JSONObject();
                 payload.put("area", "hwagok");
@@ -409,6 +581,11 @@ public class ServerClient {
         }
 
         return normalizedUrl;
+    }
+
+    private static void setTunnelHeaders(HttpURLConnection connection) {
+        connection.setRequestProperty("bypass-tunnel-reminder", "true");
+        connection.setRequestProperty("ngrok-skip-browser-warning", "true");
     }
 
     private static String toDirectionKey(float centerX) {

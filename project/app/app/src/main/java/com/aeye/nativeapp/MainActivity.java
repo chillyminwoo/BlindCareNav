@@ -79,11 +79,13 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static final int REQUEST_LOCATION_PERMISSION = 1002;
     private static final int REQUEST_AUDIO_PERMISSION = 1003;
     private static final int REQUEST_SPEECH_INPUT = 2001;
+    private static final int REQUEST_VOICE_COMMAND = 2002;
     // Keep object detection calm enough for walking guidance and demo readability.
     private static final long ANALYSIS_INTERVAL_MS = 1500;
     private static final long SPEAK_INTERVAL_MS = 3000;
     private static final long POST_INTERVAL_MS = 2500;
     private static final long HAZARD_ALERT_COOLDOWN_MS = 5000;
+    private static final long VOICE_COMMAND_FOLLOW_UP_DELAY_MS = 2400;
     private static final String PREF_NAME = "a-eye-native";
     private static final String PREF_SERVER_URL = "server-url";
     private static final String PREF_RECENT_DESTINATIONS = "recent-destinations";
@@ -109,6 +111,8 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
     private final Set<String> riskLabels = new HashSet<>();
     private final Map<String, String> koreanLabels = new HashMap<>();
+    private final VoiceCommandParser voiceCommandParser = new VoiceCommandParser();
+    private final LocalLlmInterpreter localLlmInterpreter = new RuleBasedLocalLlmInterpreter();
 
     private LinearLayout appRoot;
     private LinearLayout screenContainer;
@@ -147,7 +151,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private boolean cameraRunning = false;
     private boolean navigationSessionActive = false;
     private boolean pendingSearchSpeech = false;
+    private boolean pendingVoiceCommandAfterPermission = false;
+    private boolean pendingDestinationSpeechAfterPermission = false;
     private boolean developerStreamingEnabled = false;
+    private boolean voiceIntroSpoken = false;
     private Screen currentScreen = Screen.HOME;
     private SensorManager sensorManager;
     private Sensor rotationSensor;
@@ -230,7 +237,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             pendingSearchSpeech = false;
             mainHandler.postDelayed(() -> {
                 if (currentScreen == Screen.SEARCH) {
-                    startVoiceDestinationInput();
+                    startVoiceCommandInput();
                 }
             }, 350L);
         }
@@ -258,7 +265,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         Button voiceDestinationButton = makeButton("🎙\n목적지 말하기\n화면 아무 곳이나 탭", COLOR_BLUE, Color.WHITE);
         voiceDestinationButton.setTextSize(22);
         voiceDestinationButton.setMinHeight(dp(148));
-        voiceDestinationButton.setOnClickListener(view -> renderScreen(Screen.SEARCH, true));
+        voiceDestinationButton.setOnClickListener(view -> startVoiceCommandInput());
         root.addView(voiceDestinationButton, margin(matchWrap(), 0, 0, 0, 10));
 
         if (navigationSessionActive) {
@@ -303,7 +310,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         Button speechPanel = makeButton("🎙\n말씀하세요\n\"강남역 1번 출구\"\n\n듣는 중...", COLOR_BLUE, Color.WHITE);
         speechPanel.setTextSize(22);
         speechPanel.setMinHeight(dp(250));
-        speechPanel.setOnClickListener(view -> startVoiceDestinationInput());
+        speechPanel.setOnClickListener(view -> startVoiceCommandInput());
         root.addView(speechPanel, margin(matchWrap(), 0, 0, 0, 18));
 
         TextView recentTitle = makeSectionLabel("최근 목적지");
@@ -561,6 +568,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build());
                 applyTtsRate(getSharedPreferences(PREF_NAME, MODE_PRIVATE).getInt(PREF_TTS_RATE, 95));
+                mainHandler.postDelayed(this::startVoiceFirstIntro, 800L);
             }
         });
     }
@@ -703,6 +711,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         renderScreen(Screen.NAVIGATION, false);
         speak(lastGuideMessage, true);
         startCamera();
+        mainHandler.postDelayed(this::startVoiceCommandInput, 2600L);
     }
 
     private void stopNavigation() {
@@ -723,10 +732,24 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         updateGuide("안내를 종료했습니다.");
         speak(lastGuideMessage, true);
         renderScreen(Screen.HOME, false);
+        mainHandler.postDelayed(this::startVoiceCommandInput, 1200L);
+    }
+
+    private void startVoiceFirstIntro() {
+        if (voiceIntroSpoken || isFinishing()) {
+            return;
+        }
+
+        voiceIntroSpoken = true;
+        updateGuide("음성 명령 대기 중입니다. 목적지를 말하거나, 다시 안내, 주변 시설, 위험 정보, 긴급 연락이라고 말해 주세요.");
+        speak(lastGuideMessage, true);
+        mainHandler.postDelayed(this::startVoiceCommandInput, 1200L);
     }
 
     private void startVoiceDestinationInput() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingDestinationSpeechAfterPermission = true;
+            pendingVoiceCommandAfterPermission = false;
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_AUDIO_PERMISSION);
             return;
         }
@@ -741,6 +764,129 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         } catch (Exception error) {
             updateGuide("이 기기에서는 음성 입력을 사용할 수 없습니다.");
         }
+    }
+
+    private void startVoiceCommandInput() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingVoiceCommandAfterPermission = true;
+            pendingDestinationSpeechAfterPermission = false;
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_AUDIO_PERMISSION);
+            return;
+        }
+
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR");
+        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "명령을 말씀해 주세요. 예: 화곡역 3번 출구로 안내해줘.");
+
+        try {
+            startActivityForResult(intent, REQUEST_VOICE_COMMAND);
+        } catch (Exception error) {
+            updateGuide("이 기기에서는 음성 명령을 사용할 수 없습니다.");
+            speak(lastGuideMessage, true);
+        }
+    }
+
+    private void handleVoiceCommand(String utterance) {
+        VoiceCommand command = voiceCommandParser.parse(utterance);
+
+        if (command.getIntent() == VoiceCommand.IntentType.UNKNOWN && localLlmInterpreter.isAvailable()) {
+            command = localLlmInterpreter.interpret(utterance);
+        }
+
+        setServerStatus("음성 명령: " + command.toJsonLikeString());
+        executeVoiceCommand(command);
+    }
+
+    private void executeVoiceCommand(VoiceCommand command) {
+        switch (command.getIntent()) {
+            case NAVIGATE:
+                if (!command.hasDestination()) {
+                    updateGuide("목적지를 다시 말씀해 주세요.");
+                    speak(lastGuideMessage, true);
+                    scheduleVoiceCommandFollowUp();
+                    return;
+                }
+                updateGuide(command.getDestination() + " 안내를 시작합니다.");
+                speak(lastGuideMessage, true);
+                startNavigation(command.getDestination());
+                return;
+            case REPEAT_GUIDANCE:
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return;
+            case NEXT_GUIDANCE:
+                speak("다음 안내입니다. " + nextPreviewMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return;
+            case NEARBY:
+                readNearbyPlaces(command.getPlaceType());
+                return;
+            case RISK_INFO:
+                readRiskInformation();
+                return;
+            case EMERGENCY:
+                openGuardianSms();
+                return;
+            case STOP_NAVIGATION:
+                stopNavigation();
+                return;
+            case CURRENT_LOCATION:
+                updateGuide("현재 위치는 " + getLocationSpeechText());
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return;
+            case OPEN_SETTINGS:
+                renderScreen(Screen.SETTINGS, false);
+                updateGuide("설정 화면입니다. 서버 주소, 보호자 번호, 음성 속도를 확인할 수 있습니다.");
+                speak(lastGuideMessage, true);
+                return;
+            case FAVORITE:
+                startNavigationFromStoredDestination(true);
+                return;
+            case UNKNOWN:
+            default:
+                updateGuide("명령을 이해하지 못했습니다. 목적지로 안내해줘, 다시 안내, 주변 편의점, 위험 정보, 긴급 연락처럼 말씀해 주세요.");
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+        }
+    }
+
+    private void readNearbyPlaces(String placeType) {
+        updateGuide("현재 위치 기준 주변시설을 확인하고 있습니다.");
+        speak(lastGuideMessage, true);
+        ServerClient.requestNearby(
+                getServerUrl(),
+                currentLat,
+                currentLng,
+                placeType,
+                message -> runOnUiThread(() -> {
+                    updateGuide(message);
+                    speak(lastGuideMessage, true);
+                    scheduleVoiceCommandFollowUp();
+                })
+        );
+    }
+
+    private void readRiskInformation() {
+        updateGuide("화곡 시범구역 위험 정보를 확인하고 있습니다.");
+        speak(lastGuideMessage, true);
+        ServerClient.requestRisks(
+                getServerUrl(),
+                message -> runOnUiThread(() -> {
+                    updateGuide(message);
+                    speak(lastGuideMessage, true);
+                    scheduleVoiceCommandFollowUp();
+                })
+        );
+    }
+
+    private void scheduleVoiceCommandFollowUp() {
+        mainHandler.postDelayed(() -> {
+            if (!isFinishing() && currentScreen != Screen.SETTINGS) {
+                startVoiceCommandInput();
+            }
+        }, VOICE_COMMAND_FOLLOW_UP_DELAY_MS);
     }
 
     private void checkServer() {
@@ -899,6 +1045,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         Request request = new Request.Builder()
                 .url(wsUrl + "/ws/stream")
                 .addHeader("bypass-tunnel-reminder", "true")
+                .addHeader("ngrok-skip-browser-warning", "true")
                 .build();
         streamWebSocket = streamHttpClient.newWebSocket(request, new WebSocketListener() {
             @Override
@@ -1165,9 +1312,9 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 if (Math.abs(diffX) > Math.abs(diffY)) {
                     if (Math.abs(diffX) > SWIPE_THRESHOLD && Math.abs(velocityX) > SWIPE_VELOCITY_THRESHOLD) {
                         if (diffX > 0) {
-                            speak("위험 정보입니다. 카메라가 전방 장애물을 감지하면 즉시 알려드립니다.", true);
+                            readRiskInformation();
                         } else {
-                            speak("주변 편의시설 정보입니다. 서버 주변시설 API 연동을 준비했습니다.", true);
+                            readNearbyPlaces("");
                         }
                         return true;
                     }
@@ -1430,8 +1577,16 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             }
         } else if (requestCode == REQUEST_AUDIO_PERMISSION) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                startVoiceDestinationInput();
+                if (pendingVoiceCommandAfterPermission) {
+                    pendingVoiceCommandAfterPermission = false;
+                    startVoiceCommandInput();
+                } else {
+                    pendingDestinationSpeechAfterPermission = false;
+                    startVoiceDestinationInput();
+                }
             } else {
+                pendingVoiceCommandAfterPermission = false;
+                pendingDestinationSpeechAfterPermission = false;
                 updateGuide("음성 입력 권한이 필요합니다.");
             }
         }
@@ -1441,18 +1596,28 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
 
-        if (requestCode != REQUEST_SPEECH_INPUT || resultCode != RESULT_OK || data == null) {
+        if ((requestCode != REQUEST_SPEECH_INPUT && requestCode != REQUEST_VOICE_COMMAND)
+                || resultCode != RESULT_OK
+                || data == null) {
             return;
         }
 
         ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
 
         if (results == null || results.isEmpty()) {
-            updateGuide("음성 목적지를 인식하지 못했습니다.");
+            updateGuide("음성을 인식하지 못했습니다. 다시 말씀해 주세요.");
+            speak(lastGuideMessage, true);
+            if (requestCode == REQUEST_VOICE_COMMAND) {
+                scheduleVoiceCommandFollowUp();
+            }
             return;
         }
 
-        startNavigation(results.get(0));
+        if (requestCode == REQUEST_VOICE_COMMAND) {
+            handleVoiceCommand(results.get(0));
+        } else {
+            startNavigation(results.get(0));
+        }
     }
 
     @Override
