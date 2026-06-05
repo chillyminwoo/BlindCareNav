@@ -34,15 +34,15 @@ API 키는 코드에 직접 넣지 않습니다.
 터미널 1, 통합 FastAPI 서버:
 
 ```powershell
-cd C:\Users\KCCISTC\tmapdemo\vite-project\native-app-merge
+cd C:\Users\KCCISTC\khs_project_blindNav\vite-project\native-app-merge
 python -m pip install -r requirements.txt
-python -m uvicorn app:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app:app --reload --host 0.0.0.0 --port 8000 --ws websockets
 ```
 
 터미널 2, Vite 프론트:
 
 ```powershell
-cd C:\Users\KCCISTC\tmapdemo\vite-project\native-app-merge
+cd C:\Users\KCCISTC\khs_project_blindNav\vite-project\native-app-merge
 npm install
 npm run dev -- --host 0.0.0.0
 ```
@@ -50,13 +50,13 @@ npm run dev -- --host 0.0.0.0
 관제 화면:
 
 ```text
-http://localhost:5173
+http://localhost:8000
 ```
 
 모바일 웹 스트리밍 화면:
 
 ```text
-http://localhost:5173?mode=mobile
+http://localhost:8000?mode=mobile
 ```
 
 ## 배포형 시연
@@ -65,7 +65,7 @@ http://localhost:5173?mode=mobile
 
 ```powershell
 npm run build
-python -m uvicorn app:app --host 0.0.0.0 --port 8000
+python -m uvicorn app:app --host 0.0.0.0 --port 8000 --ws websockets
 ```
 
 이후 접속:

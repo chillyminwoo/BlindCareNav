@@ -44,7 +44,7 @@ Open `native-app` in Android Studio and run the `app` configuration.
 Command-line build on this PC:
 
 ```powershell
-cd C:\Users\KCCISTC\tmapdemo\vite-project\native-app
+cd C:\Users\KCCISTC\khs_project_blindNav\vite-project\native-app
 $env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
 & 'C:\Users\KCCISTC\.gradle\wrapper\dists\gradle-8.14.3-all\10utluxaxniiv4wxiphsi49nj\gradle-8.14.3\bin\gradle.bat' :app:assembleDebug --no-daemon
 ```
