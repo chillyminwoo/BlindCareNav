@@ -1,0 +1,55 @@
+{
+  "area": "hwagok",
+  "items": [
+    {
+      "id": "risk_001",
+      "type": "blocked_tactile_block",
+      "title": "점자블록 위 적치물",
+      "description": "화곡역 3번 출구 앞 점자블록 일부가 입간판으로 막힌 구간입니다.",
+      "lat": 37.54172,
+      "lng": 126.84092,
+      "level": "warning",
+      "status": "open"
+    },
+    {
+      "id": "risk_002",
+      "type": "construction",
+      "title": "보도 공사 구간",
+      "description": "보도 폭이 좁아지고 임시 펜스가 설치된 구간입니다.",
+      "lat": 37.54223,
+      "lng": 126.8402,
+      "level": "danger",
+      "status": "open"
+    },
+    {
+      "id": "risk_003",
+      "type": "low_branch",
+      "title": "낮은 가지 주의",
+      "description": "보행 방향 오른쪽에 낮은 가지가 있어 머리 충돌에 주의가 필요합니다.",
+      "lat": 37.54135,
+      "lng": 126.83986,
+      "level": "warning",
+      "status": "resolved"
+    },
+    {
+      "id": "risk_004",
+      "type": "uneven_surface",
+      "title": "보도 요철",
+      "description": "점자블록 주변 포장면이 고르지 않아 지팡이가 걸릴 수 있습니다.",
+      "lat": 37.54095,
+      "lng": 126.84124,
+      "level": "warning",
+      "status": "open"
+    },
+    {
+      "id": "risk_005",
+      "type": "crossing",
+      "title": "횡단보도 진입부 주의",
+      "description": "차량 진출입이 잦은 골목과 가까워 보행 신호 확인이 필요합니다.",
+      "lat": 37.54195,
+      "lng": 126.83938,
+      "level": "info",
+      "status": "open"
+    }
+  ]
+}

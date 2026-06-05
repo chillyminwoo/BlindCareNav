@@ -1,0 +1,46 @@
+# Environment and local secrets
+.env
+.env.*
+*.local
+
+# Logs and runtime output
+*.log
+logs/
+vite-project/**/data/*_logs_*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node/Vite
+node_modules/
+dist/
+dist-ssr/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# IDE / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# Downloaded model/checkpoint artifacts
+*.pt
+*.onnx
+
+# Large handoff archives
+*.zip
