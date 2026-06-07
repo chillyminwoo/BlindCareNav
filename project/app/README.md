@@ -19,6 +19,7 @@ Try commands such as:
 
 ```text
 화곡역 3번 출구로 안내해줘
+화곡역 삼번 출구로 안내해줘
 다시 안내
 다음 안내
 주변 편의점
@@ -29,6 +30,10 @@ Try commands such as:
 안내 종료
 설정 열어
 즐겨찾기
+즐겨찾기 저장
+최근 목적지
+카메라 스트리밍 시작
+카메라 스트리밍 중지
 ```
 
 ## Current Demo Model

@@ -63,6 +63,18 @@ RISK_LABELS = {
     "crossing": "횡단보도 진입부",
 }
 
+PLACE_TYPE_SEARCH_TEXT = {
+    "store": "편의점 마트 가게 매장 상점",
+    "toilet": "화장실 공중화장실",
+    "pharmacy": "약국 약방",
+    "hospital": "병원 의원 의료기관",
+    "subway": "지하철 전철 역 출구 대중교통",
+    "cafe": "카페 커피",
+    "public_office": "주민센터 공공기관 관공서 구청 동사무소",
+    "restaurant": "식당 음식점 밥집",
+    "rest_area": "쉼터 휴식 공원",
+}
+
 KOREAN_OBJECT_LABELS = {
     "person": "사람",
     "car": "차량",
@@ -184,6 +196,53 @@ def detection_log_path(area: str) -> Path:
     return DATA_DIR / f"mobile_detection_logs_{area}.jsonl"
 
 
+def emergency_log_path(area: str) -> Path:
+    if area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    return DATA_DIR / f"mobile_emergency_logs_{area}.jsonl"
+
+
+def admin_log_path(area: str, log_type: str) -> Path:
+    normalized_type = normalize_keyword(log_type)
+
+    if normalized_type in {"detections", "detection", "mobile_detections"}:
+        return detection_log_path(area)
+
+    if normalized_type in {"emergency", "emergencies", "mobile_emergency"}:
+        return emergency_log_path(area)
+
+    raise HTTPException(status_code=400, detail="지원하지 않는 로그 타입입니다.")
+
+
+def read_jsonl_tail(path: Path, limit: int = 50) -> list[dict]:
+    if not path.exists():
+        return []
+
+    safe_limit = max(1, min(limit, 500))
+
+    with path.open("r", encoding="utf-8") as log_file:
+        lines = [line.strip() for line in log_file if line.strip()]
+
+    entries = []
+
+    for line in lines[-safe_limit:]:
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            entries.append({"raw": line, "parseError": True})
+
+    return entries
+
+
+def count_jsonl(path: Path) -> int:
+    if not path.exists():
+        return 0
+
+    with path.open("r", encoding="utf-8") as log_file:
+        return sum(1 for line in log_file if line.strip())
+
+
 def distance_level_to_meter(distance_level: str) -> int:
     return {
         "near": 3,
@@ -256,6 +315,7 @@ def normalize_spoken_numbers(value: str) -> str:
     ]
 
     text = re.sub(r"(\d+)\s*번", r"\1번", text)
+    text = re.sub(r"(\d+)\s*출구", r"\1번 출구", text)
 
     for word, digit in number_words:
         text = re.sub(fr"{word}\s*(번째|번)", f"{digit}번", text)
@@ -293,40 +353,91 @@ def clean_destination_keyword(value: str) -> str:
     return " ".join(normalize_spoken_numbers(text).split())
 
 
-def place_matches_keyword(place: dict, keyword: str) -> bool:
-    if not keyword:
-        return True
+def tokenize_search_text(value: str) -> list[str]:
+    text = normalize_spoken_numbers(normalize_keyword(value))
+    tokens = re.findall(r"\d+번|\d+|[가-힣a-zA-Z]+", text)
+    return [
+        token
+        for token in tokens
+        if len(token) >= 2 or token.endswith("번") or token.isdigit()
+    ]
 
-    searchable = " ".join(
+
+def place_searchable_text(place: dict) -> str:
+    place_type = place.get("type", "")
+    return " ".join(
         [
             place.get("name", ""),
-            place.get("type", ""),
+            place_type,
+            PLACE_TYPE_SEARCH_TEXT.get(place_type, ""),
             place.get("address", ""),
             place.get("description", ""),
             " ".join(place.get("tags", [])),
         ]
     ).lower()
 
+
+def place_match_score(place: dict, keyword: str) -> int:
+    if not keyword:
+        return 1
+
+    searchable = place_searchable_text(place)
     compact_searchable = compact_keyword(searchable)
     compact_value = compact_keyword(keyword)
 
-    return keyword in searchable or bool(compact_value and compact_value in compact_searchable)
+    if keyword in searchable:
+        return 120 + len(keyword)
+
+    if compact_value and compact_value in compact_searchable:
+        return 100 + len(compact_value)
+
+    tokens = tokenize_search_text(keyword)
+
+    if not tokens:
+        return 0
+
+    matched_tokens = [
+        token
+        for token in tokens
+        if compact_keyword(token) in compact_searchable
+    ]
+
+    if len(matched_tokens) == len(tokens):
+        return 80 + len(matched_tokens)
+
+    if len(tokens) >= 3 and len(matched_tokens) >= len(tokens) - 1:
+        return 45 + len(matched_tokens)
+
+    return 0
+
+
+def place_matches_keyword(place: dict, keyword: str) -> bool:
+    return place_match_score(place, keyword) > 0
 
 
 def find_place_candidates(area: str, keyword: str, current_location: Location | None = None):
     nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
     normalized_keyword = normalize_keyword(keyword)
-    items = [
-        item
-        for item in nearby_data.get("items", [])
-        if place_matches_keyword(item, normalized_keyword)
-    ]
+    items = []
+
+    for item in nearby_data.get("items", []):
+        score = place_match_score(item, normalized_keyword)
+
+        if score > 0:
+            scored_item = dict(item)
+            scored_item["_matchScore"] = score
+            items.append(scored_item)
 
     if current_location:
-        items = sorted(
-            [add_distance(item, current_location.lat, current_location.lng) for item in items],
-            key=lambda item: item["distanceMeter"],
-        )
+        items = [add_distance(item, current_location.lat, current_location.lng) for item in items]
+
+    items = sorted(
+        items,
+        key=lambda item: (
+            -item.get("_matchScore", 0),
+            item.get("distanceMeter", 0),
+        ),
+    )
 
     return items
 
@@ -564,6 +675,7 @@ def get_admin_summary(area: str = "hwagok"):
     risk_data = load_area_json(area, RISK_FILES, "위험 지점 JSON")
     nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
     log_path = detection_log_path(area)
+    emergency_path = emergency_log_path(area)
 
     tactile_features = tactile_data.get("features", [])
     risks = risk_data.get("items", [])
@@ -571,11 +683,8 @@ def get_admin_summary(area: str = "hwagok"):
     open_risks = [risk for risk in risks if risk.get("status") == "open"]
     resolved_risks = [risk for risk in risks if risk.get("status") == "resolved"]
     danger_risks = [risk for risk in risks if risk.get("level") == "danger"]
-    detection_log_count = 0
-
-    if log_path.exists():
-        with log_path.open("r", encoding="utf-8") as log_file:
-            detection_log_count = sum(1 for line in log_file if line.strip())
+    detection_log_count = count_jsonl(log_path)
+    emergency_log_count = count_jsonl(emergency_path)
 
     return {
         "area": area,
@@ -586,6 +695,7 @@ def get_admin_summary(area: str = "hwagok"):
         "dangerRiskCount": len(danger_risks),
         "nearbyPlaceCount": len(places),
         "mobileDetectionLogCount": detection_log_count,
+        "mobileEmergencyLogCount": emergency_log_count,
     }
 
 
@@ -601,6 +711,7 @@ def search_places(payload: PlaceSearchRequest):
             "lat": item["lat"],
             "lng": item["lng"],
             "distanceMeter": item.get("distanceMeter"),
+            "matchScore": item.get("_matchScore"),
             "address": item.get("address", ""),
             "description": item.get("description", ""),
         }
@@ -615,7 +726,7 @@ def create_mobile_emergency(payload: EmergencyRequest):
     if payload.area != "hwagok":
         raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
 
-    log_path = DATA_DIR / f"mobile_emergency_logs_{payload.area}.jsonl"
+    log_path = emergency_log_path(payload.area)
     now = datetime.now(timezone.utc).isoformat()
     entry = {
         "timestamp": now,
@@ -700,15 +811,34 @@ def create_mobile_detection(payload: MobileDetectionRequest):
 @app.get("/api/admin/detections")
 def get_admin_detections(area: str = "hwagok", limit: int = 50):
     log_path = detection_log_path(area)
-
-    if not log_path.exists():
-        return {"area": area, "items": []}
-
-    with log_path.open("r", encoding="utf-8") as log_file:
-        rows = [json.loads(line) for line in log_file if line.strip()]
-
     safe_limit = max(1, min(limit, 200))
-    return {"area": area, "items": list(reversed(rows[-safe_limit:]))}
+    return {"area": area, "items": list(reversed(read_jsonl_tail(log_path, safe_limit)))}
+
+
+@app.get("/api/admin/logs")
+def get_admin_logs(area: str = "hwagok", type: str = "detections", limit: int = 50):
+    log_path = admin_log_path(area, type)
+    safe_limit = max(1, min(limit, 500))
+    return {
+        "area": area,
+        "type": type,
+        "count": count_jsonl(log_path),
+        "items": list(reversed(read_jsonl_tail(log_path, safe_limit))),
+    }
+
+
+@app.post("/api/admin/logs/clear")
+def clear_admin_logs(area: str = "hwagok", type: str = "detections"):
+    log_path = admin_log_path(area, type)
+    previous_count = count_jsonl(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    return {
+        "ok": True,
+        "area": area,
+        "type": type,
+        "clearedCount": previous_count,
+    }
 
 
 @app.get("/video_feed")

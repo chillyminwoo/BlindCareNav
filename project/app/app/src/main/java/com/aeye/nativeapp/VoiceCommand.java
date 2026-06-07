@@ -12,6 +12,10 @@ public class VoiceCommand {
         CURRENT_LOCATION,
         OPEN_SETTINGS,
         FAVORITE,
+        SAVE_FAVORITE,
+        RECENT_DESTINATION,
+        START_STREAMING,
+        STOP_STREAMING,
         UNKNOWN
     }
 

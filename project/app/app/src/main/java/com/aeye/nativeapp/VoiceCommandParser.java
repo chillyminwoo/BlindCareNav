@@ -15,7 +15,15 @@ public class VoiceCommandParser {
             return new VoiceCommand(VoiceCommand.IntentType.EMERGENCY, raw, "", "");
         }
 
-        if (containsAny(normalized, "다시", "반복", "한번더", "또말", "재생")) {
+        if (containsAny(normalized, "스트리밍중지", "카메라중지", "영상중지", "화면전송중지")) {
+            return new VoiceCommand(VoiceCommand.IntentType.STOP_STREAMING, raw, "", "");
+        }
+
+        if (containsAny(normalized, "스트리밍시작", "카메라스트리밍", "영상전송", "화면전송", "관제전송")) {
+            return new VoiceCommand(VoiceCommand.IntentType.START_STREAMING, raw, "", "");
+        }
+
+        if (containsAny(normalized, "다시", "반복", "한번더", "한번더말", "또말", "재생", "다시읽어")) {
             return new VoiceCommand(VoiceCommand.IntentType.REPEAT_GUIDANCE, raw, "", "");
         }
 
@@ -23,11 +31,11 @@ public class VoiceCommandParser {
             return new VoiceCommand(VoiceCommand.IntentType.NEXT_GUIDANCE, raw, "", "");
         }
 
-        if (containsAny(normalized, "안내종료", "길안내종료", "종료", "그만", "멈춰", "중지")) {
+        if (containsAny(normalized, "안내종료", "길안내종료", "종료", "그만", "멈춰", "중지", "네비종료", "내비종료")) {
             return new VoiceCommand(VoiceCommand.IntentType.STOP_NAVIGATION, raw, "", "");
         }
 
-        if (containsAny(normalized, "현재위치", "내위치", "여기어디", "어디야")) {
+        if (containsAny(normalized, "현재위치", "내위치", "여기어디", "어디야", "위치알려", "위치말해")) {
             return new VoiceCommand(VoiceCommand.IntentType.CURRENT_LOCATION, raw, "", "");
         }
 
@@ -35,15 +43,23 @@ public class VoiceCommandParser {
             return new VoiceCommand(VoiceCommand.IntentType.OPEN_SETTINGS, raw, "", "");
         }
 
+        if (containsAny(normalized, "즐겨찾기저장", "현재목적지저장", "목적지저장", "저장해줘")) {
+            return new VoiceCommand(VoiceCommand.IntentType.SAVE_FAVORITE, raw, "", "");
+        }
+
+        if (containsAny(normalized, "최근목적지", "최근경로", "최근장소", "방금목적지")) {
+            return new VoiceCommand(VoiceCommand.IntentType.RECENT_DESTINATION, raw, "", "");
+        }
+
         if (containsAny(normalized, "즐겨찾기", "저장한곳", "저장장소")) {
             return new VoiceCommand(VoiceCommand.IntentType.FAVORITE, raw, "", "");
         }
 
-        if (containsAny(normalized, "위험", "위험정보", "주의", "위험지점", "장애물정보")) {
+        if (containsAny(normalized, "위험", "위험정보", "주의", "위험지점", "장애물정보", "위험알려", "장애물알려")) {
             return new VoiceCommand(VoiceCommand.IntentType.RISK_INFO, raw, "", "");
         }
 
-        if (containsAny(normalized, "주변", "근처", "가까운")) {
+        if (containsAny(normalized, "주변", "근처", "가까운", "가까이", "어디있어")) {
             return new VoiceCommand(VoiceCommand.IntentType.NEARBY, raw, "", parsePlaceType(normalized));
         }
 
@@ -62,15 +78,15 @@ public class VoiceCommandParser {
     }
 
     private static String parsePlaceType(String normalized) {
-        if (containsAny(normalized, "편의점", "마트", "가게", "매장")) {
+        if (containsAny(normalized, "편의점", "마트", "가게", "매장", "상점")) {
             return "store";
         }
 
-        if (containsAny(normalized, "화장실", "화장")) {
+        if (containsAny(normalized, "화장실", "화장", "공중화장실")) {
             return "toilet";
         }
 
-        if (containsAny(normalized, "약국", "약")) {
+        if (containsAny(normalized, "약국", "약", "약방")) {
             return "pharmacy";
         }
 
@@ -78,7 +94,7 @@ public class VoiceCommandParser {
             return "hospital";
         }
 
-        if (containsAny(normalized, "지하철", "역", "출구")) {
+        if (containsAny(normalized, "지하철", "역", "출구", "전철")) {
             return "subway";
         }
 

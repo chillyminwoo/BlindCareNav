@@ -257,20 +257,24 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private View buildHomeScreen() {
         LinearLayout root = baseScreenContent();
 
-        root.addView(makeSmallTitle("① 홈"), margin(matchWrap(), 0, 0, 0, 12));
+        root.addView(makeSmallTitle("음성 안내 대기"), margin(matchWrap(), 0, 0, 0, 12));
 
         locationChipText = makeChip("현위치 확인 중...");
         root.addView(locationChipText, margin(matchWrap(), 0, 0, 0, 16));
 
-        Button voiceDestinationButton = makeButton("🎙\n목적지 말하기\n화면 아무 곳이나 탭", COLOR_BLUE, Color.WHITE);
-        voiceDestinationButton.setTextSize(22);
-        voiceDestinationButton.setMinHeight(dp(148));
-        voiceDestinationButton.setOnClickListener(view -> startVoiceCommandInput());
-        root.addView(voiceDestinationButton, margin(matchWrap(), 0, 0, 0, 10));
+        Button listeningButton = makeButton("듣기 시작\n목적지, 다시 안내, 주변시설, 긴급 연락", COLOR_BLUE, Color.WHITE);
+        listeningButton.setTextSize(24);
+        listeningButton.setMinHeight(dp(210));
+        listeningButton.setOnClickListener(view -> startVoiceCommandInput());
+        root.addView(listeningButton, margin(matchWrap(), 0, 0, 0, 12));
+
+        guideText = makePanelText(lastGuideMessage, 20, COLOR_TEXT);
+        guideText.setGravity(Gravity.CENTER);
+        root.addView(guideText, margin(matchWrap(), 0, 0, 0, 12));
 
         if (navigationSessionActive) {
             Button returnToNavigationButton = makeButton(
-                    "안내 중 · 돌아가기\n" + routeChipMessage,
+                    "안내 화면으로 돌아가기\n" + routeChipMessage,
                     COLOR_BLUE_LIGHT,
                     COLOR_BLUE_DARK
             );
@@ -279,20 +283,8 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             root.addView(returnToNavigationButton, margin(matchWrap(), 0, 0, 0, 10));
         }
 
-        LinearLayout quickGrid = new LinearLayout(this);
-        quickGrid.setOrientation(LinearLayout.HORIZONTAL);
-
-        Button favoriteButton = makeTileButton("☆\n즐겨찾기\n저장된 장소");
-        favoriteButton.setOnClickListener(view -> startNavigationFromStoredDestination(true));
-        quickGrid.addView(favoriteButton, weightedButtonParams(1f, 0, 0, 6, 0));
-
-        Button recentButton = makeTileButton("◷\n최근 경로\n지난 이동");
-        recentButton.setOnClickListener(view -> startNavigationFromStoredDestination(false));
-        quickGrid.addView(recentButton, weightedButtonParams(1f, 6, 0, 0, 0));
-
-        root.addView(quickGrid, margin(matchWrap(), 0, 0, 0, 10));
-
-        Button emergencyButton = makeEmergencyButton("SOS  긴급 연락\n보호자에게 위치 전송");
+        Button emergencyButton = makeEmergencyButton("SOS 긴급 연락\n위치 전송 후 보호자 전화");
+        emergencyButton.setMinHeight(dp(96));
         emergencyButton.setOnClickListener(view -> openGuardianSms());
         root.addView(emergencyButton, margin(matchWrap(), 0, 0, 0, 14));
 
@@ -844,12 +836,46 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             case FAVORITE:
                 startNavigationFromStoredDestination(true);
                 return;
+            case SAVE_FAVORITE:
+                saveActiveDestinationAsFavorite();
+                scheduleVoiceCommandFollowUp();
+                return;
+            case RECENT_DESTINATION:
+                startMostRecentDestination();
+                return;
+            case START_STREAMING:
+                startDeveloperStreaming();
+                updateGuide("관제 웹으로 카메라 스트리밍을 시작했습니다.");
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return;
+            case STOP_STREAMING:
+                stopDeveloperStreaming();
+                updateGuide("카메라 스트리밍을 중지했습니다.");
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return;
             case UNKNOWN:
             default:
                 updateGuide("명령을 이해하지 못했습니다. 목적지로 안내해줘, 다시 안내, 주변 편의점, 위험 정보, 긴급 연락처럼 말씀해 주세요.");
                 speak(lastGuideMessage, true);
                 scheduleVoiceCommandFollowUp();
         }
+    }
+
+    private void startMostRecentDestination() {
+        List<String> recent = getRecentDestinations();
+
+        if (recent.isEmpty()) {
+            updateGuide("최근 목적지가 없습니다. 목적지를 먼저 말씀해 주세요.");
+            speak(lastGuideMessage, true);
+            scheduleVoiceCommandFollowUp();
+            return;
+        }
+
+        updateGuide("최근 목적지 " + recent.get(0) + " 안내를 시작합니다.");
+        speak(lastGuideMessage, true);
+        startNavigation(recent.get(0));
     }
 
     private void readNearbyPlaces(String placeType) {

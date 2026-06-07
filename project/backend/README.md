@@ -32,8 +32,39 @@ POST /api/mobile/route
 POST /api/mobile/emergency
 POST /api/mobile/detections
 GET  /api/admin/detections?area=hwagok&limit=50
+GET  /api/admin/logs?area=hwagok&type=detections&limit=50
+GET  /api/admin/logs?area=hwagok&type=emergency&limit=50
+POST /api/admin/logs/clear?area=hwagok&type=detections
+POST /api/admin/logs/clear?area=hwagok&type=emergency
 GET  /video_feed
 WS   /ws/stream
+```
+
+## Smoke Tests
+
+```powershell
+$base="http://127.0.0.1:8000"
+
+Invoke-RestMethod "$base/api/health"
+Invoke-RestMethod "$base/api/admin/summary?area=hwagok"
+
+$body = @{
+  area="hwagok"
+  destinationKeyword="화곡역 삼번 출구로 안내해줘"
+  currentLocation=@{ lat=37.5421; lng=126.8413 }
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod "$base/api/mobile/route" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+Before a demo, clear local runtime logs if needed:
+
+```powershell
+Invoke-RestMethod "$base/api/admin/logs/clear?area=hwagok&type=detections" -Method Post
+Invoke-RestMethod "$base/api/admin/logs/clear?area=hwagok&type=emergency" -Method Post
 ```
 
 ## Data
