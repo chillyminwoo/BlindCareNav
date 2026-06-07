@@ -224,7 +224,43 @@ def normalize_keyword(value: str) -> str:
 
 
 def compact_keyword(value: str) -> str:
-    return "".join(normalize_keyword(value).split())
+    return "".join(normalize_spoken_numbers(normalize_keyword(value)).split())
+
+
+def normalize_spoken_numbers(value: str) -> str:
+    text = value
+    number_words = [
+        ("열", "10"),
+        ("아홉", "9"),
+        ("구", "9"),
+        ("여덟", "8"),
+        ("팔", "8"),
+        ("일곱", "7"),
+        ("칠", "7"),
+        ("여섯", "6"),
+        ("육", "6"),
+        ("다섯", "5"),
+        ("오", "5"),
+        ("넷", "4"),
+        ("네", "4"),
+        ("사", "4"),
+        ("셋", "3"),
+        ("세", "3"),
+        ("삼", "3"),
+        ("둘", "2"),
+        ("두", "2"),
+        ("이", "2"),
+        ("하나", "1"),
+        ("한", "1"),
+        ("일", "1"),
+    ]
+
+    text = re.sub(r"(\d+)\s*번", r"\1번", text)
+
+    for word, digit in number_words:
+        text = re.sub(fr"{word}\s*(번째|번)", f"{digit}번", text)
+
+    return text
 
 
 def clean_destination_keyword(value: str) -> str:
@@ -254,7 +290,7 @@ def clean_destination_keyword(value: str) -> str:
 
     text = re.sub(r"\s+(으로|로)\s*$", " ", text)
     text = re.sub(r"(으로|로)\s*$", " ", text)
-    return " ".join(text.split())
+    return " ".join(normalize_spoken_numbers(text).split())
 
 
 def place_matches_keyword(place: dict, keyword: str) -> bool:

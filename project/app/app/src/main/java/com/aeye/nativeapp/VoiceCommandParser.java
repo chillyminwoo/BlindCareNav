@@ -121,7 +121,45 @@ public class VoiceCommandParser {
             result = result.replace(phrase, " ");
         }
 
+        result = normalizeSpokenNumbers(result);
         return result.replaceAll("\\s+", " ").trim();
+    }
+
+    private static String normalizeSpokenNumbers(String value) {
+        String result = value == null ? "" : value;
+        String[][] replacements = {
+                {"열\\s*(번째|번)", "10번"},
+                {"아홉\\s*(번째|번)", "9번"},
+                {"구\\s*(번째|번)", "9번"},
+                {"여덟\\s*(번째|번)", "8번"},
+                {"팔\\s*(번째|번)", "8번"},
+                {"일곱\\s*(번째|번)", "7번"},
+                {"칠\\s*(번째|번)", "7번"},
+                {"여섯\\s*(번째|번)", "6번"},
+                {"육\\s*(번째|번)", "6번"},
+                {"다섯\\s*(번째|번)", "5번"},
+                {"오\\s*(번째|번)", "5번"},
+                {"넷\\s*(번째|번)", "4번"},
+                {"네\\s*(번째|번)", "4번"},
+                {"사\\s*(번째|번)", "4번"},
+                {"셋\\s*(번째|번)", "3번"},
+                {"세\\s*(번째|번)", "3번"},
+                {"삼\\s*(번째|번)", "3번"},
+                {"둘\\s*(번째|번)", "2번"},
+                {"두\\s*(번째|번)", "2번"},
+                {"이\\s*(번째|번)", "2번"},
+                {"하나\\s*(번째|번)", "1번"},
+                {"한\\s*(번째|번)", "1번"},
+                {"일\\s*(번째|번)", "1번"}
+        };
+
+        result = result.replaceAll("(\\d+)\\s*번", "$1번");
+
+        for (String[] replacement : replacements) {
+            result = result.replaceAll(replacement[0], replacement[1]);
+        }
+
+        return result;
     }
 
     private static boolean looksLikeDestination(String normalizedRaw, String normalizedDestination) {
