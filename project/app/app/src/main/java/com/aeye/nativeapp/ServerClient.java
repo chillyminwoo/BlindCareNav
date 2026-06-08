@@ -31,6 +31,21 @@ public class ServerClient {
         public String nextInstruction = "";
     }
 
+    public interface AssistantCallback {
+        void onResult(AssistantResult result);
+    }
+
+    public static class AssistantResult {
+        public boolean ok;
+        public String action = "speak";
+        public String intent = "unknown";
+        public String message = "";
+        public String destinationKeyword = "";
+        public String placeType = "";
+        public String guidanceMode = "";
+        public RouteResult route;
+    }
+
     private ServerClient() {
     }
 
@@ -338,6 +353,182 @@ public class ServerClient {
         }).start();
     }
 
+    public static void requestAssistantCommand(
+            String baseUrl,
+            String deviceId,
+            String utterance,
+            double lat,
+            double lng,
+            AssistantCallback callback
+    ) {
+        new Thread(() -> {
+            AssistantResult result = new AssistantResult();
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                result.message = "서버 주소가 비어 있습니다.";
+                callback.onResult(result);
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                URL url = new URL(normalizedUrl + "/api/assistant/command");
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(5000);
+                connection.setReadTimeout(7000);
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                setTunnelHeaders(connection);
+
+                JSONObject currentLocation = new JSONObject();
+                currentLocation.put("lat", lat);
+                currentLocation.put("lng", lng);
+
+                JSONObject payload = new JSONObject();
+                payload.put("area", "hwagok");
+                payload.put("deviceId", deviceId);
+                payload.put("utterance", utterance);
+                payload.put("currentLocation", currentLocation);
+
+                byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
+
+                try (OutputStream outputStream = connection.getOutputStream()) {
+                    outputStream.write(body);
+                }
+
+                int status = connection.getResponseCode();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        status >= 200 && status < 300
+                                ? connection.getInputStream()
+                                : connection.getErrorStream(),
+                        StandardCharsets.UTF_8
+                ));
+                String responseBody = reader.readLine();
+
+                if (status < 200 || status >= 300 || responseBody == null) {
+                    result.message = "누니 서버 응답 오류: HTTP " + status;
+                    callback.onResult(result);
+                    return;
+                }
+
+                JSONObject response = new JSONObject(responseBody);
+                result.ok = response.optBoolean("ok", false);
+                result.action = response.optString("action", "speak");
+                result.intent = response.optString("intent", "unknown");
+                result.message = response.optString("tts", response.optString("message", ""));
+                result.destinationKeyword = response.optString("destinationKeyword", "");
+                result.placeType = response.optString("placeType", "");
+                result.guidanceMode = response.optString("guidanceMode", "");
+
+                JSONObject route = response.optJSONObject("route");
+
+                if (route != null) {
+                    result.route = parseRouteResult(route, result.destinationKeyword);
+                }
+
+                callback.onResult(result);
+            } catch (Exception error) {
+                result.message = "누니 서버 연결 실패: " + error.getMessage();
+                callback.onResult(result);
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
+    public static void requestSceneGuidance(
+            String baseUrl,
+            String deviceId,
+            String mode,
+            double lat,
+            double lng,
+            List<Detection> detections,
+            Callback callback
+    ) {
+        new Thread(() -> {
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                callback.onResult("");
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                URL url = new URL(normalizedUrl + "/api/mobile/scene-guidance");
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(5000);
+                connection.setReadTimeout(7000);
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                setTunnelHeaders(connection);
+
+                JSONObject payload = new JSONObject();
+                payload.put("area", "hwagok");
+                payload.put("deviceId", deviceId);
+                payload.put("mode", mode == null ? "general" : mode);
+                payload.put("lat", lat);
+                payload.put("lng", lng);
+
+                JSONArray detectionArray = new JSONArray();
+                int count = Math.min(6, detections.size());
+
+                for (int index = 0; index < count; index += 1) {
+                    Detection detection = detections.get(index);
+                    JSONObject detectionObject = new JSONObject();
+                    detectionObject.put("label", detection.label);
+                    detectionObject.put("confidence", detection.confidence);
+                    detectionObject.put("direction", toDirectionKey(detection.centerX));
+                    detectionObject.put("distanceLevel", toDistanceLevelKey(detection.area()));
+                    detectionArray.put(detectionObject);
+                }
+
+                payload.put("detections", detectionArray);
+
+                byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
+
+                try (OutputStream outputStream = connection.getOutputStream()) {
+                    outputStream.write(body);
+                }
+
+                int status = connection.getResponseCode();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        status >= 200 && status < 300
+                                ? connection.getInputStream()
+                                : connection.getErrorStream(),
+                        StandardCharsets.UTF_8
+                ));
+                String responseBody = reader.readLine();
+
+                if (status < 200 || status >= 300 || responseBody == null) {
+                    callback.onResult("");
+                    return;
+                }
+
+                JSONObject response = new JSONObject(responseBody);
+                if (!response.optBoolean("shouldSpeak", true)) {
+                    callback.onResult("");
+                    return;
+                }
+
+                callback.onResult(response.optString("message", ""));
+            } catch (Exception error) {
+                callback.onResult("");
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
     public static void requestNearby(
             String baseUrl,
             double lat,
@@ -567,6 +758,54 @@ public class ServerClient {
                 }
             }
         }).start();
+    }
+
+    private static RouteResult parseRouteResult(JSONObject response, String fallbackKeyword) {
+        RouteResult result = new RouteResult();
+        result.ok = response.optBoolean("ok", false);
+
+        if (!result.ok) {
+            result.reason = response.optString("reason", "목적지를 찾지 못했습니다.");
+            return result;
+        }
+
+        JSONObject destination = response.optJSONObject("destination");
+        JSONObject summary = response.optJSONObject("summary");
+        JSONArray steps = response.optJSONArray("steps");
+
+        if (destination != null) {
+            result.destinationName = destination.optString("name", fallbackKeyword);
+        } else {
+            result.destinationName = fallbackKeyword;
+        }
+
+        if (summary != null) {
+            result.distanceMeter = summary.optInt("distanceMeter", 0);
+            result.durationMinute = summary.optInt("durationMinute", 0);
+        }
+
+        if (steps != null && steps.length() > 0) {
+            JSONObject currentStep = steps.optJSONObject(0);
+            JSONObject nextStep = steps.length() > 1 ? steps.optJSONObject(1) : null;
+
+            if (currentStep != null) {
+                result.currentInstruction = currentStep.optString("instruction", "직진 200m");
+            }
+
+            if (nextStep != null) {
+                result.nextInstruction = nextStep.optString("instruction", "다음 안내를 준비 중입니다.");
+            }
+        }
+
+        if (result.currentInstruction.isEmpty()) {
+            result.currentInstruction = "직진 200m";
+        }
+
+        if (result.nextInstruction.isEmpty()) {
+            result.nextInstruction = "다음 안내를 준비 중입니다.";
+        }
+
+        return result;
     }
 
     private static String normalizeBaseUrl(String baseUrl) {

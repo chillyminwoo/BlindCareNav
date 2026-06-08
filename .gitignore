@@ -1,6 +1,7 @@
 # Environment and local secrets
 .env
 .env.*
+!.env.example
 *.local
 
 # Logs and runtime output
@@ -41,6 +42,8 @@ Thumbs.db
 # Downloaded model/checkpoint artifacts
 *.pt
 *.onnx
+project/backend/models/
+project/backend/calibration_image_sample_data_*.npy
 
 # Large handoff archives
 *.zip

@@ -15,11 +15,11 @@ public class VoiceCommandParser {
             return new VoiceCommand(VoiceCommand.IntentType.EMERGENCY, raw, "", "");
         }
 
-        if (containsAny(normalized, "스트리밍중지", "카메라중지", "영상중지", "화면전송중지")) {
+        if (containsAny(normalized, "스트리밍중지", "스트리밍꺼", "스트리밍모드꺼", "카메라중지", "영상중지", "화면전송중지")) {
             return new VoiceCommand(VoiceCommand.IntentType.STOP_STREAMING, raw, "", "");
         }
 
-        if (containsAny(normalized, "스트리밍시작", "카메라스트리밍", "영상전송", "화면전송", "관제전송")) {
+        if (containsAny(normalized, "스트리밍시작", "스트리밍켜", "스트리밍모드켜", "카메라스트리밍", "영상전송", "화면전송", "관제전송")) {
             return new VoiceCommand(VoiceCommand.IntentType.START_STREAMING, raw, "", "");
         }
 

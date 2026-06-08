@@ -21,8 +21,8 @@ import java.util.Comparator;
 import java.util.List;
 
 public class YoloDetector implements AutoCloseable {
-    public static final String MODEL_FILE = "yolov8n_coco80_float32.tflite";
-    private static final String LABEL_FILE = "coco.txt";
+    public static final String MODEL_FILE = "blindcare_best_float32.tflite";
+    private static final String LABEL_FILE = "blindcare_labels.txt";
     private static final float SCORE_THRESHOLD = 0.45f;
     private static final float NMS_THRESHOLD = 0.45f;
     private static final int MAX_DETECTIONS = 12;

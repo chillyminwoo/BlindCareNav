@@ -1,55 +1,94 @@
-# A-eye Native App
+# 누니 Android App
 
 Android native camera + YOLO demo app for the A-eye MVP.
 
 ## What It Does
 
 - Opens the rear camera with CameraX.
-- Runs a YOLOv8n TFLite COCO 80-class model on-device.
+- Runs the team YOLO TFLite 8-class model on-device.
 - Converts detections into Korean TTS guidance.
 - Uses large yellow/black controls for low-vision and screen-reader-friendly operation.
 - Lets the phone test connectivity to the A-eye FastAPI server.
 - Posts obstacle detection events to the FastAPI server with GPS and heading.
+- Sends voice commands to `POST /api/assistant/command` first, with local rule fallback.
 
 ## Voice-First Demo Flow
 
-On launch, the app speaks a short prompt and opens Android speech recognition. The current implementation is rule-based first, with `LocalLlmInterpreter` left as the replacement point for a future on-device LLM.
+On launch, the app stays on the black/yellow Nuni listening surface. It waits for the wake phrase instead of showing buttons or opening a speech popup.
+
+Flow:
+
+```text
+앱 실행
+→ "누니야" 호출
+→ "어떤 일을 할까요?"
+→ 명령 인식
+→ POST /api/assistant/command
+→ TTS 응답
+→ 다시 "누니야" 대기
+```
+
+The current implementation sends commands to the FastAPI assistant endpoint first. Local rules remain as a fallback when the server is unavailable.
 
 Try commands such as:
 
 ```text
-화곡역 3번 출구로 안내해줘
-화곡역 삼번 출구로 안내해줘
-다시 안내
-다음 안내
-주변 편의점
-주변 화장실
-위험 정보
-현재 위치
-긴급 연락
-안내 종료
-설정 열어
-즐겨찾기
-즐겨찾기 저장
-최근 목적지
-카메라 스트리밍 시작
-카메라 스트리밍 중지
+누니야 화곡역 3번 출구로 안내해줘
+누니야 화곡역 삼번 출구로 안내해줘
+누니야 다시 안내
+누니야 다음 안내
+누니야 주변 편의점
+누니야 근처 화장실 알려줘
+누니야 위험 정보
+누니야 장애물 알려줘
+누니야 현재 위치
+누니야 긴급 연락
+누니야 안내 종료
+누니야 설정 열어
+누니야 즐겨찾기
+누니야 즐겨찾기 저장
+누니야 최근 목적지
+누니야 카메라 스트리밍 시작
+누니야 스트리밍 모드 켜줘
+누니야 카메라 스트리밍 중지
+누니야 안전한 길로 다시 안내해줘
+누니야 일반 안내 모드
+누니야 점자 안내 모드
 ```
+
+When a route starts, the app enters general guidance mode by default. General mode asks the backend to summarize current YOLO detections every 10-15 seconds. Tactile mode focuses on braille-block sections and interrupts when the model sees a braille block and an obstacle together.
 
 ## Current Demo Model
 
-`app/src/main/assets/yolov8n_coco80_float32.tflite`
+`app/src/main/assets/blindcare_best_float32.tflite`
 
-The active model is a YOLOv8n float32 TFLite model exported from a COCO-pretrained YOLOv8n checkpoint. It uses the 80 labels in `app/src/main/assets/coco.txt`.
+The active model is a YOLO float32 TFLite model exported from the team `best.pt`. It uses the 8 labels in `app/src/main/assets/blindcare_labels.txt`.
 
-The previous smaller person-only demo model is still kept as:
+Current labels:
+
+```text
+bicycle
+braille_block
+car
+green_light
+kickboard
+motorcycle
+person
+red_light
+```
+
+The previous demo models are still kept as:
 
 ```text
 app/src/main/assets/yolov8n_demo.tflite
+app/src/main/assets/yolov8n_coco80_float32.tflite
+app/src/main/assets/coco.txt
 ```
 
 `YoloDetector` supports common YOLOv8 TFLite output layouts:
 
+- `[1, 12, 8400]`
+- `[1, 8400, 12]`
 - `[1, 84, 8400]`
 - `[1, 8400, 84]`
 
@@ -59,7 +98,7 @@ Current verified model shape:
 
 ```text
 input:  [1, 640, 640, 3] float32
-output: [1, 84, 8400] float32
+output: [1, 12, 8400] float32
 ```
 
 ## Build

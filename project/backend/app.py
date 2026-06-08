@@ -3,6 +3,8 @@ import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from math import asin, atan2, cos, degrees, radians, sin, sqrt
 from pathlib import Path
@@ -34,7 +36,12 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
-MODEL_PATH = BASE_DIR / "yolo11n.pt"
+DEFAULT_MODEL_PATH = BASE_DIR / "models" / "best.pt"
+LEGACY_MODEL_PATH = BASE_DIR / "yolo11n.pt"
+MODEL_PATH = Path(os.getenv("BLINDCARE_YOLO_MODEL", str(DEFAULT_MODEL_PATH)))
+
+if not MODEL_PATH.exists() and LEGACY_MODEL_PATH.exists():
+    MODEL_PATH = LEGACY_MODEL_PATH
 
 TACTILE_FILES = {
     "hwagok": "tactile_blocks_hwagok.geojson",
@@ -77,11 +84,15 @@ PLACE_TYPE_SEARCH_TEXT = {
 
 KOREAN_OBJECT_LABELS = {
     "person": "사람",
+    "braille_block": "점자블록",
     "car": "차량",
     "truck": "차량",
     "bus": "버스",
     "bicycle": "자전거",
     "motorcycle": "오토바이",
+    "kickboard": "킥보드",
+    "green_light": "초록 신호",
+    "red_light": "빨간 신호",
     "bench": "벤치",
     "chair": "의자",
     "backpack": "가방",
@@ -97,6 +108,10 @@ latest_processed_frame = None
 last_tts_time = 0.0
 tts_cooldown_second = 4.0
 yolo_model = None
+latest_control_destination: dict = {}
+latest_control_route: dict = {}
+cached_lmstudio_model: str | None = None
+lmstudio_disabled_until = 0.0
 
 
 class Location(BaseModel):
@@ -120,6 +135,14 @@ class MobileRouteRequest(BaseModel):
     area: str = "hwagok"
     destinationKeyword: str = ""
     currentLocation: Location | None = None
+
+
+class AssistantCommandRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    utterance: str = ""
+    currentLocation: Location | None = None
+    routeState: dict | None = None
 
 
 class EmergencyRequest(BaseModel):
@@ -146,6 +169,32 @@ class MobileDetectionRequest(BaseModel):
     heading: float | None = None
     detections: list[DetectionItem] = Field(default_factory=list)
     message: str = ""
+
+
+class ControlDestinationRequest(BaseModel):
+    area: str = "hwagok"
+    destination: str = ""
+    lat: float | None = None
+    lng: float | None = None
+    source: str = "app"
+    mode: str = "navigation"
+
+
+class RouteCandidateSyncRequest(BaseModel):
+    area: str = "hwagok"
+    destination: dict = Field(default_factory=dict)
+    start: dict = Field(default_factory=dict)
+    candidates: list[dict] = Field(default_factory=list)
+
+
+class SceneGuidanceRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    mode: str = "general"
+    lat: float | None = None
+    lng: float | None = None
+    detections: list[DetectionItem] = Field(default_factory=list)
+    routeState: dict | None = None
 
 
 def load_area_json(area: str, file_map: dict[str, str], missing_label: str):
@@ -353,6 +402,350 @@ def clean_destination_keyword(value: str) -> str:
     return " ".join(normalize_spoken_numbers(text).split())
 
 
+def strip_wake_word(value: str) -> str:
+    text = value or ""
+    wake_words = ["누니야", "누니", "눈이야", "눈이", "nuni"]
+
+    for wake_word in wake_words:
+        text = re.sub(wake_word, " ", text, flags=re.IGNORECASE)
+
+    return " ".join(text.split())
+
+
+def assistant_compact(value: str) -> str:
+    return compact_keyword(strip_wake_word(value))
+
+
+def assistant_contains_any(text: str, *keywords: str) -> bool:
+    compact_text = assistant_compact(text)
+    return any(compact_keyword(keyword) in compact_text for keyword in keywords)
+
+
+def parse_assistant_place_type(text: str) -> str:
+    if assistant_contains_any(text, "편의점", "마트", "가게", "상점", "매장"):
+        return "store"
+    if assistant_contains_any(text, "화장실", "공중화장실", "화장"):
+        return "toilet"
+    if assistant_contains_any(text, "약국", "약방", "약"):
+        return "pharmacy"
+    if assistant_contains_any(text, "병원", "의원", "의료"):
+        return "hospital"
+    if assistant_contains_any(text, "지하철", "역", "출구", "전철"):
+        return "subway"
+    if assistant_contains_any(text, "카페", "커피"):
+        return "cafe"
+    if assistant_contains_any(text, "주민센터", "관공서", "구청", "동사무소"):
+        return "public_office"
+    if assistant_contains_any(text, "식당", "음식점", "밥집"):
+        return "restaurant"
+    return ""
+
+
+def looks_like_destination_command(text: str) -> bool:
+    return assistant_contains_any(
+        text,
+        "안내",
+        "길 안내",
+        "경로",
+        "찾아",
+        "가줘",
+        "가자",
+        "데려다",
+        "목적지",
+        "출구",
+        "정문",
+        "후문",
+    )
+
+
+def summarize_nearby_places(area: str, current_location: Location | None, place_type: str = ""):
+    location = current_location or Location(lat=37.54167, lng=126.84028)
+    nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
+    items = nearby_data.get("items", [])
+
+    if place_type:
+        items = [item for item in items if item.get("type") == place_type]
+
+    sorted_items = sorted(
+        [add_distance(item, location.lat, location.lng) for item in items],
+        key=lambda item: item["distanceMeter"],
+    )
+    top_items = sorted_items[:3]
+
+    if not top_items:
+        return "현재 위치 주변에서 해당 시설을 찾지 못했습니다.", []
+
+    phrases = []
+
+    for index, item in enumerate(top_items, start=1):
+        phrases.append(f"{index}번 {item['name']}, 약 {item['distanceMeter']}미터")
+
+    return "가까운 주변시설입니다. " + ". ".join(phrases), top_items
+
+
+def summarize_open_risks(area: str, current_location: Location | None):
+    risk_data = load_area_json(area, RISK_FILES, "위험 지점 JSON")
+    open_risks = [risk for risk in risk_data.get("items", []) if risk.get("status") == "open"]
+
+    if current_location:
+        open_risks = [
+            add_distance(risk, current_location.lat, current_location.lng)
+            for risk in open_risks
+        ]
+        open_risks = sorted(open_risks, key=lambda risk: risk["distanceMeter"])
+
+    top_risks = open_risks[:3]
+
+    if not top_risks:
+        return "현재 열린 위험 지점은 없습니다.", []
+
+    phrases = []
+
+    for index, risk in enumerate(top_risks, start=1):
+        distance = risk.get("distanceMeter")
+        distance_text = f", 약 {distance}미터" if distance is not None else ""
+        phrases.append(f"{index}번 {risk.get('title', '위험 지점')}{distance_text}, {risk.get('level', '주의')}")
+
+    return "현재 확인된 위험 정보입니다. " + ". ".join(phrases), top_risks
+
+
+def summarize_latest_detections(area: str):
+    entries = read_jsonl_tail(detection_log_path(area), 1)
+
+    if not entries:
+        return "최근 감지된 장애물 기록은 없습니다.", []
+
+    latest = entries[-1]
+    detections = latest.get("detections", [])
+
+    if not detections:
+        return "최근 감지 기록은 있지만 장애물 목록은 비어 있습니다.", []
+
+    primary = detections[0]
+    label = KOREAN_OBJECT_LABELS.get(primary.get("label"), primary.get("label", "장애물"))
+    direction = primary.get("direction", "front")
+    distance_level = primary.get("distanceLevel", "unknown")
+    confidence = round(float(primary.get("confidence", 0)) * 100)
+    message = f"최근 감지된 장애물은 {label}입니다. 방향 {direction}, 거리 {distance_level}, 신뢰도 {confidence}퍼센트입니다."
+    return message, entries
+
+
+def assistant_llm_enabled() -> bool:
+    value = os.getenv("BLINDCARE_ASSISTANT_USE_LLM", "1").lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def lmstudio_base_url() -> str:
+    raw = (
+        os.getenv("BLINDCARE_OPENAI_BASE_URL")
+        or os.getenv("BLINDCARE_LMSTUDIO_BASE_URL")
+        or "http://172.19.176.1:1234"
+    ).strip()
+
+    if not raw:
+        return ""
+
+    raw = raw.rstrip("/")
+    if not raw.endswith("/v1"):
+        raw = raw + "/v1"
+    return raw
+
+
+def lmstudio_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("BLINDCARE_OPENAI_API_KEY", "").strip()
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    return headers
+
+
+def get_lmstudio_model() -> str:
+    global cached_lmstudio_model
+
+    explicit_model = os.getenv("BLINDCARE_OPENAI_MODEL") or os.getenv("BLINDCARE_LMSTUDIO_MODEL")
+    if explicit_model:
+        return explicit_model.strip()
+
+    if cached_lmstudio_model:
+        return cached_lmstudio_model
+
+    base_url = lmstudio_base_url()
+    if not base_url:
+        return "local-model"
+
+    request = urllib.request.Request(
+        f"{base_url}/models",
+        headers=lmstudio_headers(),
+        method="GET",
+    )
+
+    with urllib.request.urlopen(request, timeout=1.8) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    models = data.get("data", [])
+    if models:
+        cached_lmstudio_model = str(models[0].get("id") or "local-model")
+        return cached_lmstudio_model
+
+    return "local-model"
+
+
+def call_lmstudio_chat(messages: list[dict], timeout: float = 3.5, temperature: float = 0.2) -> str:
+    global lmstudio_disabled_until
+
+    if not assistant_llm_enabled():
+        return ""
+
+    if time.time() < lmstudio_disabled_until:
+        return ""
+
+    base_url = lmstudio_base_url()
+    if not base_url:
+        return ""
+
+    try:
+        model = get_lmstudio_model()
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 360,
+                "stream": False,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=body,
+            headers=lmstudio_headers(),
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError, KeyError, IndexError):
+        lmstudio_disabled_until = time.time() + 20.0
+        return ""
+
+
+def extract_json_object(text: str) -> dict:
+    if not text:
+        return {}
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return {}
+
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+
+
+def latest_detection_context(area: str) -> list[dict]:
+    return read_jsonl_tail(detection_log_path(area), 3)
+
+
+def build_llm_command_hint(payload: AssistantCommandRequest, command_text: str) -> dict:
+    if not assistant_llm_enabled() or not command_text.strip():
+        return {}
+
+    nearby_data = load_area_json(payload.area, NEARBY_FILES, "주변시설 JSON")
+    place_names = [
+        {
+            "name": item.get("name"),
+            "type": item.get("type"),
+            "aliases": item.get("tags", []),
+        }
+        for item in nearby_data.get("items", [])[:30]
+    ]
+    context = {
+        "area": payload.area,
+        "currentLocation": payload.currentLocation.dict() if payload.currentLocation else None,
+        "places": place_names,
+        "latestDetections": latest_detection_context(payload.area),
+        "routeState": payload.routeState or {},
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "너는 시각장애인 보행 내비게이션 앱 '누니'의 한국어 음성 명령 해석기다. "
+                "반드시 JSON 객체 하나만 출력한다. "
+                "허용 intent/action은 navigate/start_navigation, nearby/speak, risk_info/speak, "
+                "current_location/speak, detection_info/speak, safer_reroute/start_navigation, "
+                "start_streaming/start_streaming, stop_streaming/stop_streaming, "
+                "general_mode/set_guidance_mode, tactile_mode/set_guidance_mode, "
+                "emergency/emergency, stop_navigation/stop_navigation, repeat_guidance/repeat_guidance, "
+                "unknown/speak 이다. "
+                "목적지 안내라면 destinationKeyword를 장소명만 짧게 넣고, 주변시설이면 placeType을 "
+                "toilet/store/pharmacy/hospital/subway/cafe/restaurant/public_office 중 하나로 넣는다. "
+                "모드를 바꾸는 명령이면 guidanceMode를 general 또는 tactile로 넣는다. "
+                "확신이 없으면 unknown으로 둔다."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "utterance": command_text,
+                    "context": context,
+                    "outputSchema": {
+                        "intent": "string",
+                        "action": "string",
+                        "destinationKeyword": "string",
+                        "placeType": "string",
+                        "guidanceMode": "string",
+                        "tts": "string",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    return extract_json_object(call_lmstudio_chat(messages, timeout=3.2, temperature=0.0))
+
+
+def maybe_polish_assistant_message(intent: str, message: str, context: dict) -> str:
+    if not assistant_llm_enabled():
+        return message
+
+    prompt_context = json.dumps(context, ensure_ascii=False)[:1600]
+    polished = call_lmstudio_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "너는 시각장애인 보행 내비게이션 음성 안내문을 만드는 비서다. "
+                    "새로운 사실을 만들지 말고, 제공된 문장과 컨텍스트만 사용한다. "
+                    "최종 안내문만 짧고 명확한 한국어로 출력한다."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"의도: {intent}\n안내문: {message}\n컨텍스트: {prompt_context}",
+            },
+        ],
+        timeout=2.5,
+        temperature=0.2,
+    )
+
+    if 0 < len(polished) <= 260:
+        return polished
+
+    return message
+
+
 def tokenize_search_text(value: str) -> list[str]:
     text = normalize_spoken_numbers(normalize_keyword(value))
     tokens = re.findall(r"\d+번|\d+|[가-힣a-zA-Z]+", text)
@@ -531,6 +924,288 @@ def build_mobile_route_response(area: str, keyword: str, current_location: Locat
     }
 
 
+def set_control_destination(
+    area: str,
+    destination: str,
+    lat: float | None = None,
+    lng: float | None = None,
+    source: str = "app",
+    mode: str = "navigation",
+):
+    global latest_control_destination
+
+    destination_name = (destination or "").strip()
+    resolved_lat = lat
+    resolved_lng = lng
+    place_id = ""
+    place_type = ""
+
+    if destination_name and (resolved_lat is None or resolved_lng is None):
+        candidates = find_place_candidates(area, destination_name, None)
+        if candidates:
+            best = candidates[0]
+            resolved_lat = best.get("lat")
+            resolved_lng = best.get("lng")
+            destination_name = best.get("name", destination_name)
+            place_id = best.get("id", "")
+            place_type = best.get("type", "")
+
+    latest_control_destination = {
+        "ok": True,
+        "area": area,
+        "destination": destination_name,
+        "lat": resolved_lat,
+        "lng": resolved_lng,
+        "source": source,
+        "mode": mode,
+        "placeId": place_id,
+        "placeType": place_type,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    return latest_control_destination
+
+
+def set_control_destination_from_route(area: str, route: dict, source: str = "app"):
+    if not route.get("ok"):
+        return
+
+    destination = route.get("destination", {})
+    set_control_destination(
+        area,
+        destination.get("name", route.get("keyword", "")),
+        destination.get("lat"),
+        destination.get("lng"),
+        source=source,
+    )
+
+
+def build_assistant_command_response(payload: AssistantCommandRequest):
+    raw_utterance = payload.utterance or ""
+    command_text = strip_wake_word(raw_utterance)
+    compact_text = assistant_compact(command_text)
+
+    def response(intent: str, action: str, message: str, **extra):
+        context = extra.pop("context", {})
+        final_message = maybe_polish_assistant_message(intent, message, context)
+        return {
+            "ok": True,
+            "area": payload.area,
+            "deviceId": payload.deviceId,
+            "utterance": raw_utterance,
+            "commandText": command_text,
+            "intent": intent,
+            "action": action,
+            "message": final_message,
+            "tts": final_message,
+            "context": context,
+            **extra,
+        }
+
+    def navigation_response(destination_keyword: str, intent: str = "navigate"):
+        route = build_mobile_route_response(payload.area, destination_keyword, payload.currentLocation)
+
+        if not route.get("ok"):
+            alternatives = route.get("alternatives", [])
+            alt_text = ""
+
+            if alternatives:
+                names = ", ".join(item.get("name", "") for item in alternatives[:3])
+                alt_text = f" 가까운 후보는 {names}입니다."
+
+            return response(
+                intent,
+                "speak",
+                route.get("reason", "목적지 후보를 찾지 못했습니다.") + alt_text,
+                destinationKeyword=destination_keyword,
+                route=route,
+                context={"alternatives": alternatives},
+            )
+
+        set_control_destination_from_route(payload.area, route, source=payload.deviceId)
+        destination = route.get("destination", {})
+        summary = route.get("summary", {})
+        message = (
+            f"{destination.get('name', destination_keyword)} 안내를 시작합니다. "
+            f"거리 {summary.get('distanceMeter', 0)}미터, 약 {summary.get('durationMinute', 1)}분입니다."
+        )
+        return response(
+            intent,
+            "start_navigation",
+            message,
+            destinationKeyword=destination_keyword,
+            route=route,
+            context={
+                "destination": destination,
+                "summary": summary,
+                "steps": route.get("steps", []),
+            },
+        )
+
+    if not compact_text:
+        return response(
+            "listen",
+            "listen",
+            "누니가 듣고 있습니다. 목적지 안내, 주변시설, 위험 정보, 긴급 연락처럼 말씀해 주세요.",
+        )
+
+    llm_hint = build_llm_command_hint(payload, command_text)
+    llm_intent = str(llm_hint.get("intent", "")).strip()
+    llm_action = str(llm_hint.get("action", "")).strip()
+
+    if llm_intent in {"navigate", "safer_reroute"} or llm_action == "start_navigation":
+        destination_keyword = str(llm_hint.get("destinationKeyword", "")).strip() or clean_destination_keyword(command_text)
+        return navigation_response(destination_keyword, llm_intent or "navigate")
+
+    if llm_action == "set_guidance_mode":
+        guidance_mode = str(llm_hint.get("guidanceMode", "")).strip()
+        if guidance_mode == "tactile":
+            return response("tactile_mode", "set_guidance_mode", "점자 안내 모드로 전환하겠습니다.", guidanceMode="tactile")
+        if guidance_mode == "general":
+            return response("general_mode", "set_guidance_mode", "일반 안내 모드로 전환하겠습니다.", guidanceMode="general")
+
+    if llm_action in {"start_streaming", "stop_streaming", "emergency", "stop_navigation", "repeat_guidance"}:
+        message = str(llm_hint.get("tts", "")).strip()
+        default_messages = {
+            "start_streaming": "관제 웹으로 카메라 스트리밍을 시작하겠습니다.",
+            "stop_streaming": "카메라 스트리밍을 중지하겠습니다.",
+            "emergency": "긴급 위치를 서버에 기록하고 보호자 전화 화면을 열겠습니다.",
+            "stop_navigation": "안내를 종료하겠습니다.",
+            "repeat_guidance": "현재 안내를 다시 읽겠습니다.",
+        }
+        return response(llm_intent or llm_action, llm_action, message or default_messages[llm_action])
+
+    if llm_intent == "nearby":
+        place_type = str(llm_hint.get("placeType", "")).strip() or parse_assistant_place_type(command_text)
+        message, places = summarize_nearby_places(payload.area, payload.currentLocation, place_type)
+        return response("nearby", "speak", message, placeType=place_type, context={"places": places})
+
+    if llm_intent == "risk_info":
+        message, risks = summarize_open_risks(payload.area, payload.currentLocation)
+        return response("risk_info", "speak", message, context={"risks": risks})
+
+    if llm_intent == "detection_info":
+        message, detections = summarize_latest_detections(payload.area)
+        return response("detection_info", "speak", message, context={"detections": detections})
+
+    if llm_intent == "current_location":
+        location = payload.currentLocation
+        if location:
+            message = f"현재 위치는 위도 {location.lat:.5f}, 경도 {location.lng:.5f}입니다."
+        else:
+            message = "현재 위치 정보가 아직 없습니다."
+        return response("current_location", "speak", message)
+
+    if assistant_contains_any(command_text, "긴급", "보호자", "도와줘", "살려줘", "sos"):
+        return response(
+            "emergency",
+            "emergency",
+            "긴급 위치를 서버에 기록하고 보호자 전화 화면을 열겠습니다.",
+        )
+
+    if assistant_contains_any(
+        command_text,
+        "스트리밍 중지",
+        "스트리밍 꺼",
+        "스트리밍 모드 꺼",
+        "카메라 중지",
+        "영상 중지",
+        "화면 전송 중지",
+    ):
+        return response("stop_streaming", "stop_streaming", "카메라 스트리밍을 중지하겠습니다.")
+
+    if assistant_contains_any(
+        command_text,
+        "스트리밍 시작",
+        "스트리밍 켜",
+        "스트리밍 모드 켜",
+        "카메라 스트리밍",
+        "영상 전송",
+        "화면 전송",
+        "관제 전송",
+    ):
+        return response("start_streaming", "start_streaming", "관제 웹으로 카메라 스트리밍을 시작하겠습니다.")
+
+    if assistant_contains_any(command_text, "일반 안내 모드", "일반 모드", "일반 안내"):
+        return response("general_mode", "set_guidance_mode", "일반 안내 모드로 전환하겠습니다.", guidanceMode="general")
+
+    if assistant_contains_any(command_text, "점자 안내 모드", "점자 모드", "점자 안내"):
+        return response("tactile_mode", "set_guidance_mode", "점자 안내 모드로 전환하겠습니다.", guidanceMode="tactile")
+
+    if assistant_contains_any(command_text, "안전한 길", "안전 경로", "우회", "재탐색"):
+        destination_keyword = latest_control_destination.get("destination", "")
+        if destination_keyword:
+            return navigation_response(destination_keyword, "safer_reroute")
+        return response("safer_reroute", "speak", "현재 목적지가 없어 안전 경로를 다시 계산할 수 없습니다. 목적지를 먼저 말씀해 주세요.")
+
+    if assistant_contains_any(command_text, "다시", "반복", "한번 더", "재생", "다시 읽어"):
+        return response("repeat_guidance", "repeat_guidance", "현재 안내를 다시 읽겠습니다.")
+
+    if assistant_contains_any(command_text, "다음", "미리", "다음 안내", "다음 길"):
+        return response("next_guidance", "next_guidance", "다음 안내를 읽겠습니다.")
+
+    if assistant_contains_any(command_text, "안내 종료", "길 안내 종료", "그만", "멈춰", "중지", "네비 종료", "내비 종료"):
+        return response("stop_navigation", "stop_navigation", "안내를 종료하겠습니다.")
+
+    if assistant_contains_any(command_text, "현재 위치", "내 위치", "여기 어디", "어디야", "위치 알려", "위치 말해"):
+        location = payload.currentLocation
+        if location:
+            message = f"현재 위치는 위도 {location.lat:.5f}, 경도 {location.lng:.5f}입니다."
+        else:
+            message = "현재 위치 정보가 아직 없습니다."
+        return response("current_location", "speak", message)
+
+    if assistant_contains_any(command_text, "설정", "서버 주소", "보호자 번호", "tts"):
+        return response("open_settings", "open_settings", "설정 화면을 열겠습니다.")
+
+    if assistant_contains_any(command_text, "즐겨찾기 저장", "현재 목적지 저장", "목적지 저장", "저장해줘"):
+        return response("save_favorite", "save_favorite", "현재 목적지를 즐겨찾기에 저장하겠습니다.")
+
+    if assistant_contains_any(command_text, "최근 목적지", "최근 경로", "최근 장소", "방금 목적지"):
+        return response("recent_destination", "recent_destination", "최근 목적지 안내를 시작하겠습니다.")
+
+    if assistant_contains_any(command_text, "즐겨찾기", "저장한 곳", "저장 장소"):
+        return response("favorite", "favorite", "즐겨찾기 목적지 안내를 시작하겠습니다.")
+
+    if assistant_contains_any(command_text, "위험", "위험 정보", "위험 지점", "장애물 정보"):
+        message, risks = summarize_open_risks(payload.area, payload.currentLocation)
+        return response(
+            "risk_info",
+            "speak",
+            message,
+            context={"risks": risks},
+        )
+
+    if assistant_contains_any(command_text, "장애물", "감지된 것", "뭐 있어", "앞에 뭐"):
+        message, detections = summarize_latest_detections(payload.area)
+        return response(
+            "detection_info",
+            "speak",
+            message,
+            context={"detections": detections},
+        )
+
+    if assistant_contains_any(command_text, "주변", "근처", "가까운", "가까이", "어디 있어"):
+        place_type = parse_assistant_place_type(command_text)
+        message, places = summarize_nearby_places(payload.area, payload.currentLocation, place_type)
+        return response(
+            "nearby",
+            "speak",
+            message,
+            placeType=place_type,
+            context={"places": places},
+        )
+
+    if looks_like_destination_command(command_text):
+        destination_keyword = clean_destination_keyword(command_text)
+        return navigation_response(destination_keyword)
+
+    return response(
+        "unknown",
+        "speak",
+        "명령을 이해하지 못했습니다. 누니야, 화곡역 3번 출구로 안내해줘처럼 말씀해 주세요.",
+    )
+
+
 def get_yolo_model():
     global yolo_model
 
@@ -581,6 +1256,7 @@ def health_check():
     return {
         "status": "ok",
         "dataDir": str(DATA_DIR),
+        "yoloModelPath": str(MODEL_PATH),
         "yoloReady": YOLO is not None and MODEL_PATH.exists(),
     }
 
@@ -662,11 +1338,142 @@ def create_guidance(payload: GuidanceRequest):
 
 @app.post("/api/mobile/route")
 def create_mobile_route(payload: MobileRouteRequest):
-    return build_mobile_route_response(
+    route = build_mobile_route_response(
         payload.area,
         payload.destinationKeyword,
         payload.currentLocation,
     )
+    set_control_destination_from_route(payload.area, route, source="mobile-route")
+    return route
+
+
+@app.post("/api/assistant/command")
+def handle_assistant_command(payload: AssistantCommandRequest):
+    return build_assistant_command_response(payload)
+
+
+@app.post("/api/set_destination")
+def set_destination(payload: ControlDestinationRequest):
+    if payload.area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    if not payload.destination.strip():
+        raise HTTPException(status_code=400, detail="목적지가 비어 있습니다.")
+
+    return set_control_destination(
+        payload.area,
+        payload.destination,
+        payload.lat,
+        payload.lng,
+        source=payload.source,
+        mode=payload.mode,
+    )
+
+
+@app.get("/api/get_destination")
+def get_destination():
+    if not latest_control_destination:
+        return {
+            "ok": True,
+            "destination": "",
+            "lat": None,
+            "lng": None,
+            "updatedAt": None,
+        }
+
+    return latest_control_destination
+
+
+@app.post("/api/control/clear_destination")
+def clear_control_destination():
+    global latest_control_destination, latest_control_route
+    latest_control_destination = {}
+    latest_control_route = {}
+    return {"ok": True, "message": "관제 목적지와 경로 후보를 초기화했습니다."}
+
+
+@app.post("/api/control/route-candidates")
+def sync_route_candidates(payload: RouteCandidateSyncRequest):
+    global latest_control_route
+
+    latest_control_route = {
+        "ok": True,
+        "area": payload.area,
+        "destination": payload.destination,
+        "start": payload.start,
+        "candidates": payload.candidates,
+        "best": payload.candidates[0] if payload.candidates else None,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    return {
+        "ok": True,
+        "candidateCount": len(payload.candidates),
+        "best": latest_control_route["best"],
+    }
+
+
+@app.get("/api/control/current-route")
+def get_current_route():
+    if not latest_control_route:
+        return {"ok": True, "candidates": [], "best": None, "updatedAt": None}
+
+    return latest_control_route
+
+
+@app.post("/api/mobile/scene-guidance")
+def create_scene_guidance(payload: SceneGuidanceRequest):
+    mode = (payload.mode or "general").lower()
+    detections = sorted(payload.detections, key=lambda item: item.confidence, reverse=True)
+    obstacles = [
+        detection
+        for detection in detections
+        if detection.label != "braille_block" and detection.confidence >= 0.45
+    ]
+    has_braille_block = any(detection.label == "braille_block" and detection.confidence >= 0.45 for detection in detections)
+
+    if mode == "tactile" and has_braille_block and obstacles:
+        primary = obstacles[0]
+        label = KOREAN_OBJECT_LABELS.get(primary.label, primary.label)
+        message = f"점자블록 위에 {label}로 보이는 장애물이 있습니다. 주의하세요."
+        return {
+            "ok": True,
+            "mode": mode,
+            "shouldSpeak": True,
+            "message": maybe_polish_assistant_message(
+                "tactile_scene_guidance",
+                message,
+                {"detections": [item.dict() for item in detections[:5]]},
+            ),
+        }
+
+    if not obstacles:
+        return {
+            "ok": True,
+            "mode": mode,
+            "shouldSpeak": True,
+            "message": "전방에 뚜렷한 장애물은 보이지 않습니다.",
+        }
+
+    phrases = []
+    for detection in obstacles[:3]:
+        label = KOREAN_OBJECT_LABELS.get(detection.label, detection.label)
+        confidence = round(detection.confidence * 100)
+        phrases.append(f"{detection.direction} {detection.distanceLevel}에 {label}, 신뢰도 {confidence}퍼센트")
+
+    message = "현재 카메라 화면 기준으로 " + ". ".join(phrases) + "가 보입니다."
+    return {
+        "ok": True,
+        "mode": mode,
+        "shouldSpeak": True,
+        "message": maybe_polish_assistant_message(
+            "general_scene_guidance",
+            message,
+            {
+                "detections": [item.dict() for item in detections[:5]],
+                "routeState": payload.routeState or {},
+            },
+        ),
+    }
 
 
 @app.get("/api/admin/summary")

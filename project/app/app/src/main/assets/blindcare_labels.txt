@@ -1,0 +1,8 @@
+bicycle
+braille_block
+car
+green_light
+kickboard
+motorcycle
+person
+red_light
