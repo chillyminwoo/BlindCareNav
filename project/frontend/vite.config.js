@@ -4,14 +4,18 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: true,
-    port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:8000",
-      "/video_feed": "http://127.0.0.1:8000",
-      "/ws": {
-        target: "ws://127.0.0.1:8000",
-        ws: true,
+      "/api": {
+        target: "https://resisting-espionage-stallion.ngrok-free.dev",
+        changeOrigin: true,
+        secure: false,
+        headers: { "ngrok-skip-browser-warning": "true" },
+      },
+      "/video_feed": {
+        target: "https://resisting-espionage-stallion.ngrok-free.dev",
+        changeOrigin: true,
+        secure: false,
+        headers: { "ngrok-skip-browser-warning": "true" },
       },
     },
   },
