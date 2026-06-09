@@ -6,16 +6,22 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "https://resisting-espionage-stallion.ngrok-free.dev",
+        target: "http://localhost:8000",
         changeOrigin: true,
         secure: false,
-        headers: { "ngrok-skip-browser-warning": "true" },
       },
+      // 추가: MJPEG 스트리밍
       "/video_feed": {
-        target: "https://resisting-espionage-stallion.ngrok-free.dev",
+        target: "http://localhost:8000",
         changeOrigin: true,
         secure: false,
-        headers: { "ngrok-skip-browser-warning": "true" },
+      },
+      // 추가: WebSocket (앱 카메라 연결)
+      "/ws": {
+        target: "ws://localhost:8000",
+        ws: true,
+        changeOrigin: true,
+        secure: false,
       },
     },
   },

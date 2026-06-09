@@ -108,8 +108,19 @@ latest_processed_frame = None
 last_tts_time = 0.0
 tts_cooldown_second = 4.0
 yolo_model = None
+STREAM_SERVER_YOLO = os.getenv("BLINDCARE_STREAM_SERVER_YOLO", "").lower() in {"1", "true", "yes"}
 latest_control_destination: dict = {}
 latest_control_route: dict = {}
+latest_stream_status: dict = {
+    "area": "hwagok",
+    "deviceId": "demo-phone-01",
+    "requested": False,
+    "active": False,
+    "requestedBy": "",
+    "updatedAt": None,
+    "message": "",
+}
+mobile_command_queues: dict[str, list[dict]] = {}
 cached_lmstudio_model: str | None = None
 lmstudio_disabled_until = 0.0
 
@@ -151,6 +162,25 @@ class EmergencyRequest(BaseModel):
     lat: float
     lng: float
     heading: float | None = None
+    message: str = ""
+
+
+class SupportRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    lat: float
+    lng: float
+    heading: float | None = None
+    message: str = ""
+    mode: str = "general"
+    sceneDescription: str = ""
+    detections: list[dict] = Field(default_factory=list)
+
+
+class StreamControlRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    requestedBy: str = "control-web"
     message: str = ""
 
 
@@ -252,6 +282,13 @@ def emergency_log_path(area: str) -> Path:
     return DATA_DIR / f"mobile_emergency_logs_{area}.jsonl"
 
 
+def support_log_path(area: str) -> Path:
+    if area != "hwagok":
+        raise HTTPException(status_code=404, detail="Unsupported area")
+
+    return DATA_DIR / f"support_requests_{area}.jsonl"
+
+
 def admin_log_path(area: str, log_type: str) -> Path:
     normalized_type = normalize_keyword(log_type)
 
@@ -260,6 +297,9 @@ def admin_log_path(area: str, log_type: str) -> Path:
 
     if normalized_type in {"emergency", "emergencies", "mobile_emergency"}:
         return emergency_log_path(area)
+
+    if normalized_type in {"support", "supports", "help", "support_requests"}:
+        return support_log_path(area)
 
     raise HTTPException(status_code=400, detail="지원하지 않는 로그 타입입니다.")
 
@@ -290,6 +330,87 @@ def count_jsonl(path: Path) -> int:
 
     with path.open("r", encoding="utf-8") as log_file:
         return sum(1 for line in log_file if line.strip())
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_jsonl(path: Path, entry: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    entries = []
+    with path.open("r", encoding="utf-8") as log_file:
+        for line in log_file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                entries.append({"raw": line, "parseError": True})
+    return entries
+
+
+def replace_jsonl(path: Path, entries: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as log_file:
+        for entry in entries:
+            log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def enqueue_mobile_command(device_id: str, command_type: str, payload: dict | None = None) -> dict:
+    command = {
+        "id": f"{command_type}-{int(time.time() * 1000)}",
+        "type": command_type,
+        "payload": payload or {},
+        "createdAt": utc_now(),
+    }
+    mobile_command_queues.setdefault(device_id, []).append(command)
+    return command
+
+
+def current_stream_snapshot() -> dict:
+    return {**latest_stream_status, "pendingCommandCount": sum(len(items) for items in mobile_command_queues.values())}
+
+
+def write_support_event(payload: SupportRequest, request_type: str) -> dict:
+    if payload.area != "hwagok":
+        raise HTTPException(status_code=404, detail="Unsupported area")
+
+    normalized_type = "emergency" if request_type == "emergency" else "help"
+    now = utc_now()
+    entry = {
+        "id": f"{normalized_type}-{int(time.time() * 1000)}",
+        "timestamp": now,
+        "updatedAt": now,
+        "area": payload.area,
+        "type": normalized_type,
+        "status": "open",
+        "priority": "critical" if normalized_type == "emergency" else "assist",
+        "deviceId": payload.deviceId,
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "mode": payload.mode,
+        "message": payload.message or ("Emergency request" if normalized_type == "emergency" else "Help request"),
+        "sceneDescription": payload.sceneDescription,
+        "detections": payload.detections[:8],
+        "mapUrl": f"https://maps.google.com/?q={payload.lat},{payload.lng}",
+    }
+    write_jsonl(support_log_path(payload.area), entry)
+    print(
+        f"[support-{normalized_type}] {payload.deviceId} {payload.lat},{payload.lng} {entry['message']}",
+        flush=True,
+    )
+    return entry
 
 
 def distance_level_to_meter(distance_level: str) -> int:
@@ -1063,16 +1184,18 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         if guidance_mode == "general":
             return response("general_mode", "set_guidance_mode", "일반 안내 모드로 전환하겠습니다.", guidanceMode="general")
 
-    if llm_action in {"start_streaming", "stop_streaming", "emergency", "stop_navigation", "repeat_guidance"}:
+    if llm_action in {"start_streaming", "stop_streaming", "help", "emergency", "stop_navigation", "repeat_guidance"}:
         message = str(llm_hint.get("tts", "")).strip()
         default_messages = {
-            "start_streaming": "관제 웹으로 카메라 스트리밍을 시작하겠습니다.",
-            "stop_streaming": "카메라 스트리밍을 중지하겠습니다.",
+            "start_streaming": "카메라 스트리밍은 관제에서 요청하면 자동으로 시작됩니다.",
+            "stop_streaming": "카메라 스트리밍은 관제에서 종료할 수 있습니다.",
+            "help": "도움 요청을 관제에 전달하겠습니다.",
             "emergency": "긴급 위치를 서버에 기록하고 보호자 전화 화면을 열겠습니다.",
             "stop_navigation": "안내를 종료하겠습니다.",
             "repeat_guidance": "현재 안내를 다시 읽겠습니다.",
         }
-        return response(llm_intent or llm_action, llm_action, message or default_messages[llm_action])
+        action = "speak" if llm_action in {"start_streaming", "stop_streaming"} else llm_action
+        return response(llm_intent or llm_action, action, message or default_messages[llm_action])
 
     if llm_intent == "nearby":
         place_type = str(llm_hint.get("placeType", "")).strip() or parse_assistant_place_type(command_text)
@@ -1095,7 +1218,14 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
             message = "현재 위치 정보가 아직 없습니다."
         return response("current_location", "speak", message)
 
-    if assistant_contains_any(command_text, "긴급", "보호자", "도와줘", "살려줘", "sos"):
+    if assistant_contains_any(command_text, "도움", "도와줘", "도와주세요", "막혔어", "길막힘"):
+        return response(
+            "help",
+            "help",
+            "도움 요청을 관제에 전달하겠습니다. 현재 위치와 최근 감지 정보를 함께 보냅니다.",
+        )
+
+    if assistant_contains_any(command_text, "긴급", "보호자", "살려줘", "다쳤어", "119", "sos"):
         return response(
             "emergency",
             "emergency",
@@ -1111,7 +1241,7 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         "영상 중지",
         "화면 전송 중지",
     ):
-        return response("stop_streaming", "stop_streaming", "카메라 스트리밍을 중지하겠습니다.")
+        return response("stop_streaming", "speak", "카메라 스트리밍은 관제에서 종료할 수 있습니다.")
 
     if assistant_contains_any(
         command_text,
@@ -1123,7 +1253,7 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         "화면 전송",
         "관제 전송",
     ):
-        return response("start_streaming", "start_streaming", "관제 웹으로 카메라 스트리밍을 시작하겠습니다.")
+        return response("start_streaming", "speak", "카메라 스트리밍은 관제에서 스트림 보기를 누르면 자동으로 시작됩니다.")
 
     if assistant_contains_any(command_text, "일반 안내 모드", "일반 모드", "일반 안내"):
         return response("general_mode", "set_guidance_mode", "일반 안내 모드로 전환하겠습니다.", guidanceMode="general")
@@ -1258,15 +1388,7 @@ def health_check():
         "dataDir": str(DATA_DIR),
         "yoloModelPath": str(MODEL_PATH),
         "yoloReady": YOLO is not None and MODEL_PATH.exists(),
-    }
-
-
-@app.get("/")
-def root():
-    return {
-        "service": "BlindCareNav backend",
-        "health": "/api/health",
-        "adminSummary": "/api/admin/summary?area=hwagok",
+        "streamServerYolo": STREAM_SERVER_YOLO,
     }
 
 
@@ -1350,6 +1472,41 @@ def create_mobile_route(payload: MobileRouteRequest):
 @app.post("/api/assistant/command")
 def handle_assistant_command(payload: AssistantCommandRequest):
     return build_assistant_command_response(payload)
+
+
+@app.get("/api/assistant/health")
+def get_assistant_health():
+    base_url = lmstudio_base_url()
+    enabled = assistant_llm_enabled()
+
+    if not enabled:
+        return {
+            "ok": True,
+            "llmEnabled": False,
+            "baseUrl": base_url,
+            "available": False,
+            "message": "LLM is disabled. Rule-based assistant fallback is active.",
+        }
+
+    try:
+        model = get_lmstudio_model()
+        return {
+            "ok": True,
+            "llmEnabled": True,
+            "baseUrl": base_url,
+            "available": True,
+            "model": model,
+            "message": "LM Studio/OpenAI-compatible assistant is reachable.",
+        }
+    except Exception as error:
+        return {
+            "ok": True,
+            "llmEnabled": True,
+            "baseUrl": base_url,
+            "available": False,
+            "model": None,
+            "message": f"LLM is not reachable. Rule-based fallback will be used. {error}",
+        }
 
 
 @app.post("/api/set_destination")
@@ -1483,6 +1640,7 @@ def get_admin_summary(area: str = "hwagok"):
     nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
     log_path = detection_log_path(area)
     emergency_path = emergency_log_path(area)
+    support_path = support_log_path(area)
 
     tactile_features = tactile_data.get("features", [])
     risks = risk_data.get("items", [])
@@ -1492,6 +1650,10 @@ def get_admin_summary(area: str = "hwagok"):
     danger_risks = [risk for risk in risks if risk.get("level") == "danger"]
     detection_log_count = count_jsonl(log_path)
     emergency_log_count = count_jsonl(emergency_path)
+    support_entries = read_jsonl(support_path)
+    open_support_entries = [entry for entry in support_entries if entry.get("status") == "open"]
+    help_support_entries = [entry for entry in support_entries if entry.get("type") == "help"]
+    emergency_support_entries = [entry for entry in support_entries if entry.get("type") == "emergency"]
 
     return {
         "area": area,
@@ -1503,6 +1665,10 @@ def get_admin_summary(area: str = "hwagok"):
         "nearbyPlaceCount": len(places),
         "mobileDetectionLogCount": detection_log_count,
         "mobileEmergencyLogCount": emergency_log_count,
+        "supportRequestCount": len(support_entries),
+        "openSupportRequestCount": len(open_support_entries),
+        "supportHelpCount": len(help_support_entries),
+        "supportEmergencyCount": len(emergency_support_entries),
     }
 
 
@@ -1528,6 +1694,146 @@ def search_places(payload: PlaceSearchRequest):
     return {"area": payload.area, "keyword": payload.keyword, "candidates": candidates}
 
 
+@app.post("/api/support/help")
+def create_support_help(payload: SupportRequest):
+    entry = write_support_event(payload, "help")
+    return {
+        "ok": True,
+        "message": "도움 요청을 관제에 전달했습니다.",
+        "entry": entry,
+    }
+
+
+@app.post("/api/support/emergency")
+def create_support_emergency(payload: SupportRequest):
+    entry = write_support_event(payload, "emergency")
+    emergency_entry = {
+        "timestamp": entry["timestamp"],
+        "area": payload.area,
+        "deviceId": payload.deviceId,
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "message": payload.message or "관제 긴급 요청",
+        "mapUrl": entry["mapUrl"],
+        "supportRequestId": entry["id"],
+    }
+    write_jsonl(emergency_log_path(payload.area), emergency_entry)
+    return {
+        "ok": True,
+        "message": "긴급 요청을 관제에 전달했습니다.",
+        "entry": entry,
+    }
+
+
+@app.get("/api/admin/support-requests")
+def get_admin_support_requests(area: str = "hwagok", type: str = "all", status: str = "all", limit: int = 50):
+    entries = list(reversed(read_jsonl(support_log_path(area))))
+    normalized_type = normalize_keyword(type)
+    normalized_status = normalize_keyword(status)
+
+    if normalized_type != "all":
+        entries = [entry for entry in entries if entry.get("type") == normalized_type]
+
+    if normalized_status != "all":
+        entries = [entry for entry in entries if entry.get("status") == normalized_status]
+
+    safe_limit = max(1, min(limit, 200))
+    return {
+        "area": area,
+        "count": len(entries),
+        "items": entries[:safe_limit],
+    }
+
+
+@app.post("/api/admin/support-requests/{request_id}/resolve")
+def resolve_admin_support_request(request_id: str, area: str = "hwagok", memo: str = ""):
+    path = support_log_path(area)
+    entries = read_jsonl(path)
+    found = None
+    now = utc_now()
+
+    for entry in entries:
+        if entry.get("id") == request_id:
+            entry["status"] = "resolved"
+            entry["resolvedAt"] = now
+            entry["adminMemo"] = memo
+            found = entry
+            break
+
+    if found is None:
+        raise HTTPException(status_code=404, detail="Support request not found")
+
+    replace_jsonl(path, entries)
+    return {"ok": True, "entry": found}
+
+
+@app.post("/api/control/stream/start")
+def request_control_stream_start(payload: StreamControlRequest):
+    latest_stream_status.update(
+        {
+            "area": payload.area,
+            "deviceId": payload.deviceId,
+            "requested": True,
+            "requestedBy": payload.requestedBy,
+            "updatedAt": utc_now(),
+            "message": payload.message or "Control web requested camera stream.",
+        }
+    )
+    command = enqueue_mobile_command(
+        payload.deviceId,
+        "start_stream",
+        {
+            "area": payload.area,
+            "message": "관제에서 카메라 스트리밍을 요청했습니다.",
+        },
+    )
+    return {"ok": True, "stream": current_stream_snapshot(), "command": command}
+
+
+@app.post("/api/control/stream/stop")
+def request_control_stream_stop(payload: StreamControlRequest):
+    global latest_processed_frame
+    latest_stream_status.update(
+        {
+            "area": payload.area,
+            "deviceId": payload.deviceId,
+            "requested": False,
+            "active": False,
+            "requestedBy": payload.requestedBy,
+            "updatedAt": utc_now(),
+            "message": payload.message or "Control web stopped camera stream.",
+        }
+    )
+    latest_processed_frame = None
+    command = enqueue_mobile_command(
+        payload.deviceId,
+        "stop_stream",
+        {
+            "area": payload.area,
+            "message": "관제에서 카메라 스트리밍을 종료했습니다.",
+        },
+    )
+    return {"ok": True, "stream": current_stream_snapshot(), "command": command}
+
+
+@app.get("/api/control/stream/status")
+def get_control_stream_status():
+    return {"ok": True, "stream": current_stream_snapshot()}
+
+
+@app.get("/api/mobile/commands")
+def get_mobile_commands(deviceId: str = "demo-phone-01", area: str = "hwagok"):
+    commands = mobile_command_queues.pop(deviceId, [])
+    return {
+        "ok": True,
+        "area": area,
+        "deviceId": deviceId,
+        "commands": commands,
+        "stream": current_stream_snapshot(),
+    }
+
+
 @app.post("/api/mobile/emergency")
 def create_mobile_emergency(payload: EmergencyRequest):
     if payload.area != "hwagok":
@@ -1548,6 +1854,22 @@ def create_mobile_emergency(payload: EmergencyRequest):
 
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    support_entry = write_support_event(
+        SupportRequest(
+            area=payload.area,
+            deviceId=payload.deviceId,
+            lat=payload.lat,
+            lng=payload.lng,
+            heading=payload.heading,
+            message=payload.message or "Mobile emergency request",
+            mode="emergency",
+            sceneDescription="",
+            detections=[],
+        ),
+        "emergency",
+    )
+    entry["supportRequestId"] = support_entry["id"]
 
     print(
         "[mobile-emergency]",
@@ -1650,9 +1972,6 @@ def clear_admin_logs(area: str = "hwagok", type: str = "detections"):
 
 @app.get("/video_feed")
 async def video_feed():
-    if YOLO is None or cv2 is None or np is None:
-        raise HTTPException(status_code=503, detail="YOLO stream dependencies are not installed.")
-
     return StreamingResponse(
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -1663,19 +1982,35 @@ async def video_feed():
 async def websocket_endpoint(websocket: WebSocket):
     global latest_processed_frame, last_tts_time
     await websocket.accept()
+    latest_stream_status.update(
+        {
+            "active": True,
+            "requested": True,
+            "updatedAt": utc_now(),
+            "message": "Smartphone stream connected.",
+        }
+    )
 
-    try:
-        model = get_yolo_model()
-    except Exception as error:
-        await websocket.send_text(f"YOLO 서버 준비 실패: {error}")
-        await websocket.close()
-        return
+    model = None
+
+    if STREAM_SERVER_YOLO:
+        try:
+            model = get_yolo_model()
+        except Exception as error:
+            await websocket.send_text(f"YOLO 서버 준비 실패: {error}")
+            await websocket.close()
+            return
 
     print("[mobile-stream] smartphone camera connected")
 
     try:
         while True:
             data = await websocket.receive_bytes()
+
+            if not STREAM_SERVER_YOLO:
+                latest_processed_frame = data
+                continue
+
             nparr = np.frombuffer(data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -1697,8 +2032,33 @@ async def websocket_endpoint(websocket: WebSocket):
             latest_processed_frame = buffer.tobytes()
     except WebSocketDisconnect:
         print("[mobile-stream] smartphone camera disconnected")
+        latest_stream_status.update(
+            {
+                "active": False,
+                "updatedAt": utc_now(),
+                "message": "Smartphone stream disconnected.",
+            }
+        )
     except Exception as error:
         print(f"[mobile-stream] processing error: {error}")
+        latest_stream_status.update(
+            {
+                "active": False,
+                "updatedAt": utc_now(),
+                "message": f"Smartphone stream error: {error}",
+            }
+        )
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "BlindCareNav backend",
+        "health": "/api/health",
+        "adminSummary": "/api/admin/summary?area=hwagok",
+        "supportRequests": "/api/admin/support-requests?area=hwagok",
+        "streamStatus": "/api/control/stream/status",
+    }
 
 
 if __name__ == "__main__":
