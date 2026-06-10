@@ -141,11 +141,18 @@ export default function App() {
   // streamInfo: { requested, active, pendingCommandCount, ... }
   const [streamInfo,      setStreamInfo      ] = useState({ requested: false, active: false });
   // streamToken: 바뀔 때마다 <img> src가 재로드되어 최신 프레임을 가져옴
-  const [streamToken,     setStreamToken     ] = useState(Date.now());
+  const [streamToken,     setStreamToken     ] = useState(0);
   // streamLog: 디버깅용 — 스트림 관련 이벤트 기록
   const [streamLog,       setStreamLog       ] = useState("대기 중");
+  const streamRetryRef    = useRef(null);  // [FIX] active 상태일 때 주기적으로 img 재시도
+
+  // [FIX] 지도 클릭 핸들러가 stale closure 없이 최신값을 쓰도록 ref로 유지
+  const tactileGeoJsonRef = useRef(null);
+  const poiDataRef        = useRef({ crosswalks: [], trafficLights: [] });
 
   useEffect(() => { currentPosRef.current = currentPosition; }, [currentPosition]);
+  useEffect(() => { tactileGeoJsonRef.current = tactileGeoJson; }, [tactileGeoJson]);
+  useEffect(() => { poiDataRef.current = poiData; }, [poiData]);
   useEffect(() => {
     ensureGlobalStyles();
     return () => { if (dangerTimerRef.current) clearTimeout(dangerTimerRef.current); };
@@ -176,6 +183,9 @@ export default function App() {
 
   const updateOverlayRef = useRef(updateLocationOverlay);
   useEffect(() => { updateOverlayRef.current = updateLocationOverlay; }, [updateLocationOverlay]);
+
+  // [FIX] 지도 클릭 핸들러가 stale closure 없이 최신 calculateAndDrawRoute를 쓰도록 ref 유지
+  const calculateAndDrawRouteRef = useRef(null);
 
   const clearMapObjects = useCallback((refs) => {
     refs.current.forEach((o) => o.setMap(null));
@@ -311,6 +321,7 @@ export default function App() {
       });
     }
   }, [drawRouteCandidates, poiData, setDestinationMarker, tactileGeoJson]);
+  useEffect(() => { calculateAndDrawRouteRef.current = calculateAndDrawRoute; }, [calculateAndDrawRoute]);
 
   const pollControlDestination = useCallback(async () => {
     if (!backendAliveRef.current) return;
@@ -363,11 +374,11 @@ export default function App() {
         setStreamInfo(info);
         if (start) {
           // 명령이 전달된 후 2초 뒤 img src를 갱신 (앱 반응 시간 고려)
-          setTimeout(() => setStreamToken(Date.now()), 2000);
-          setStreamLog(`명령 전송 완료. 앱 pending: ${info.pendingCommandCount ?? "?"}개`);
+          setStreamLog(`명령 전송 완료. 앱 pending: ${info.pendingCommandCount ?? "?"}개. 앱 연결 대기 중...`);
           setStatus("방송 요청을 앱으로 전송했습니다. 앱이 카메라를 켜면 자동으로 표시됩니다.");
         } else {
-          setStreamToken(0); // src 초기화
+          setStreamToken(0);
+          if (streamRetryRef.current) { clearInterval(streamRetryRef.current); streamRetryRef.current = null; }
           setStreamLog("중지됨");
           setStatus("스트리밍을 중지했습니다.");
         }
@@ -411,7 +422,14 @@ export default function App() {
         setStreamLog(`백엔드: requested=${next.requested} active=${next.active} pending=${next.pendingCommandCount ?? 0}`);
         // 앱이 방금 연결됐을 때(active가 false→true) 자동으로 이미지 갱신
         if (next.active && !prev.active) {
+          // [FIX] 앱 연결 감지 → 즉시 + 3초마다 img 갱신 (프레임 버퍼 채워질 때까지 재시도)
           setStreamToken(Date.now());
+          if (streamRetryRef.current) clearInterval(streamRetryRef.current);
+          streamRetryRef.current = setInterval(() => setStreamToken(Date.now()), 3000);
+        }
+        if (!next.active && prev.active) {
+          // 연결 끊김 → retry 중단
+          if (streamRetryRef.current) { clearInterval(streamRetryRef.current); streamRetryRef.current = null; }
         }
       }
 
@@ -504,7 +522,9 @@ export default function App() {
               const addr = result[0].road_address?.address_name
                         || result[0].address?.address_name
                         || name;
-              name = addr;
+              // 건물명/상호명이 있으면 앞에 붙임
+              const building = result[0].road_address?.building_name || "";
+              name = building ? `${building} (${addr})` : addr;
             }
 
             // 백엔드에 목적지 저장 (앱이 폴링으로 수신)
@@ -522,7 +542,7 @@ export default function App() {
             }).catch(() => {});
 
             // 관제 웹 자체 UI 즉시 반영
-            //updateOverlayRef.current({ lat, lng }, headingRef.current);
+            // [FIX] updateOverlayRef 제거 — 현재위치 마커가 목적지로 이동하는 버그
             setDestinationState({ lat, lng, name });
             destinationNameRef.current = name;
             setStatus(`목적지 설정: ${name}`);
@@ -536,6 +556,11 @@ export default function App() {
             destinationMarkerRef.current = new window.kakao.maps.Marker({
               map, position: latlng, title: name, image: img,
             });
+
+            // [FIX] calculateAndDrawRouteRef 사용 → 항상 최신 함수 참조, 클릭 즉시 경로 반영
+            if (calculateAndDrawRouteRef.current) {
+              calculateAndDrawRouteRef.current({ lat, lng }, name);
+            }
           });
         });
       });
@@ -586,9 +611,21 @@ export default function App() {
         </div>
 
         <section>
+          <div className="section-title"><h2>현재 위치</h2></div>
+          <p className="plain" style={{ fontSize:"12px" }}>
+            {`위도 ${currentPosition.lat.toFixed(5)}, 경도 ${currentPosition.lng.toFixed(5)}`}
+          </p>
+        </section>
+        <section>
           <div className="section-title"><h2>현재 목적지</h2></div>
           <p className="plain">
-            {destination ? `${destination.name} (${destination.lat.toFixed(5)}, ${destination.lng.toFixed(5)})` : "앱에서 목적지를 설정하면 표시됩니다."}
+            {destination
+              ? (<>
+                  <span style={{ fontWeight:"bold", fontSize:"14px" }}>{destination.name}</span>
+                  <br/>
+                  <span style={{ fontSize:"11px", opacity:0.7 }}>{`${destination.lat.toFixed(5)}, ${destination.lng.toFixed(5)}`}</span>
+                </>)
+              : "앱에서 목적지를 설정하거나 지도를 클릭하세요."}
           </p>
         </section>
 
