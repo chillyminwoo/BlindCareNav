@@ -13,6 +13,27 @@ const OVERPASS_SERVERS = [
   "https://z.overpass-api.de/api/interpreter",
 ];
 
+const KOREAN_OBJECT_LABELS = {
+  person: "사람",
+  braille_block: "점자블록",
+  car: "차량",
+  truck: "차량",
+  bus: "버스",
+  bicycle: "자전거",
+  motorcycle: "오토바이",
+  kickboard: "킥보드",
+  green_light: "초록 신호",
+  red_light: "빨간 신호",
+  bench: "벤치",
+  chair: "의자",
+  backpack: "가방",
+  handbag: "가방",
+  suitcase: "캐리어",
+  umbrella: "우산",
+  bottle: "병",
+  cup: "컵",
+};
+
 const safeJson = async (res) => {
   if (!res.ok) return null;
   try { return await res.json(); } catch { return null; }
@@ -104,7 +125,8 @@ export default function App() {
   const routeLinesRef         = useRef([]);
   const tactileLinesRef       = useRef([]);
   const riskMarkersRef        = useRef([]);
-  const detectionMarkersRef   = useRef([]);
+  // ← detectionMarkersRef 제거, 아래로 교체
+  const tactileHazardMarkersRef = useRef([]);
   const supportMarkersRef     = useRef([]);
   const poiOverlaysRef        = useRef([]);
   const destinationNameRef    = useRef("");
@@ -117,16 +139,18 @@ export default function App() {
   const orientationHandlerRef = useRef(null);
   const dangerTimerRef        = useRef(null);
   const prevEmergencyCountRef = useRef(null);
+  const prevHazardCountRef    = useRef(null);
   const calculateAndDrawRouteRef = useRef(null);
   const tactileGeoJsonRef     = useRef(null);
   const poiDataRef            = useRef({ crosswalks: [], trafficLights: [] });
 
-  // ── 스트림 전용 refs ────────────────────────────────────
-  // streamInfo를 ref로 유지 → refreshBackendData 의존성 루프 차단
+  const mobilePosRef          = useRef(null);
+  const mobileLocModeRef      = useRef("mobile");
+
   const streamInfoRef         = useRef({ requested: false, active: false });
-  const streamActiveRef       = useRef(false);  // active 상태 빠른 접근용
-  const canvasRef             = useRef(null);   // MJPEG 렌더링 canvas
-  const mjpegAbortRef         = useRef(null);   // fetch AbortController
+  const streamActiveRef       = useRef(false);
+  const canvasRef             = useRef(null);
+  const mjpegAbortRef         = useRef(null);
   const streamLogRef          = useRef("대기 중");
 
   const [status,          setStatus         ] = useState("관제 웹을 준비하고 있습니다.");
@@ -135,16 +159,18 @@ export default function App() {
   const [routeCandidates, setRouteCandidates ] = useState([]);
   const [summary,         setSummary         ] = useState(null);
   const [risks,           setRisks           ] = useState([]);
-  const [detections,      setDetections      ] = useState([]);
+  // ← detections state 제거
   const [supportRequests, setSupportRequests ] = useState([]);
   const [tactileGeoJson,  setTactileGeoJson  ] = useState(null);
   const [poiData,         setPoiData         ] = useState({ crosswalks: [], trafficLights: [] });
   const [dangerAlert,     setDangerAlert     ] = useState(false);
   const [streamVisible,   setStreamVisible   ] = useState(true);
+  const [locMode,         setLocMode         ] = useState("mobile");
   const [streamUiInfo,    setStreamUiInfo    ] = useState({ requested: false, active: false });
   const [streamLog,       setStreamLog       ] = useState("대기 중");
 
   useEffect(() => { currentPosRef.current = currentPosition; }, [currentPosition]);
+  useEffect(() => { mobileLocModeRef.current = locMode; }, [locMode]);
   useEffect(() => { tactileGeoJsonRef.current = tactileGeoJson; }, [tactileGeoJson]);
   useEffect(() => { poiDataRef.current = poiData; }, [poiData]);
   useEffect(() => {
@@ -157,8 +183,6 @@ export default function App() {
   }, []);
 
   // ── MJPEG canvas 렌더러 ──────────────────────────────────
-  // <img>로 multipart/x-mixed-replace를 받으면 브라우저가 "완료"를 기다려 무한로딩 발생
-  // fetch + ReadableStream으로 JPEG 프레임을 직접 파싱해 canvas에 그림
   const stopMjpeg = useCallback(() => {
     if (mjpegAbortRef.current) {
       mjpegAbortRef.current.abort();
@@ -183,7 +207,6 @@ export default function App() {
         }
 
         const contentType = res.headers.get("content-type") || "";
-        // boundary 파싱: multipart/x-mixed-replace; boundary=frame
         const boundaryMatch = contentType.match(/boundary=([^\s;]+)/);
         const boundary = boundaryMatch ? `--${boundaryMatch[1]}` : "--frame";
         const boundaryBytes = new TextEncoder().encode(boundary);
@@ -209,7 +232,6 @@ export default function App() {
         };
 
         const CRLF2 = new Uint8Array([13, 10, 13, 10]);
-
         setStreamLog("스트림 수신 중...");
 
         while (true) {
@@ -217,26 +239,21 @@ export default function App() {
           if (done) break;
           appendBuf(value);
 
-          // 버퍼에서 완성된 JPEG 프레임을 꺼내 canvas에 그림
           while (true) {
             const boundaryIdx = indexOfSeq(buf, boundaryBytes);
             if (boundaryIdx === -1) break;
-
             const headerEnd = indexOfSeq(buf, CRLF2, boundaryIdx);
             if (headerEnd === -1) break;
-
             const nextBoundary = indexOfSeq(buf, boundaryBytes, boundaryIdx + boundaryBytes.length);
             if (nextBoundary === -1) break;
 
             const jpegStart = headerEnd + 4;
-            // CRLF 앞까지가 JPEG 데이터
             const jpegEnd = nextBoundary - 2;
             if (jpegEnd <= jpegStart) { buf = buf.slice(nextBoundary); break; }
 
             const jpegBytes = buf.slice(jpegStart, jpegEnd);
             buf = buf.slice(nextBoundary);
 
-            // canvas에 그리기
             const blob = new Blob([jpegBytes], { type: "image/jpeg" });
             const imgUrl = URL.createObjectURL(blob);
             const img = new Image();
@@ -261,28 +278,17 @@ export default function App() {
     })();
   }, [stopMjpeg]);
 
-  // ── 현위치 오버레이 ──────────────────────────────────────
-  const updateLocationOverlay = useCallback((point, heading) => {
-    if (!mapRef.current) return;
-    const latlng = toLatLng(point);
-    if (!dotMarkerRef.current) {
-      dotMarkerRef.current = new window.kakao.maps.Marker({ map: mapRef.current, position: latlng, image: buildDotMarkerImage(), zIndex: 10 });
-    } else { dotMarkerRef.current.setPosition(latlng); }
-    if (!pulseOverlayRef.current) {
-      pulseOverlayRef.current = new window.kakao.maps.CustomOverlay({ map: mapRef.current, position: latlng, content: buildPulseOverlayDom(), zIndex: 9 });
-    } else { pulseOverlayRef.current.setPosition(latlng); }
-    if (heading !== null && heading !== undefined) {
-      if (!fanOverlayRef.current) {
-        const { svg, path } = buildFanOverlayDom();
-        fanPathElemRef.current = path;
-        fanOverlayRef.current = new window.kakao.maps.CustomOverlay({ map: mapRef.current, position: latlng, content: svg, zIndex: 8 });
-      } else { fanOverlayRef.current.setPosition(latlng); }
-      fanPathElemRef.current.setAttribute("d", calcFanPath(heading));
-    } else if (fanOverlayRef.current) {
-      fanOverlayRef.current.setMap(null);
-      fanOverlayRef.current = null; fanPathElemRef.current = null;
-    }
-  }, []);
+// 변경 후
+const updateLocationOverlay = useCallback((point) => {
+  if (!mapRef.current) return;
+  const latlng = toLatLng(point);
+  if (!dotMarkerRef.current) {
+    dotMarkerRef.current = new window.kakao.maps.Marker({ map: mapRef.current, position: latlng, image: buildDotMarkerImage(), zIndex: 10 });
+  } else { dotMarkerRef.current.setPosition(latlng); }
+  if (!pulseOverlayRef.current) {
+    pulseOverlayRef.current = new window.kakao.maps.CustomOverlay({ map: mapRef.current, position: latlng, content: buildPulseOverlayDom(), zIndex: 9 });
+  } else { pulseOverlayRef.current.setPosition(latlng); }
+}, []);
 
   const updateOverlayRef = useRef(updateLocationOverlay);
   useEffect(() => { updateOverlayRef.current = updateLocationOverlay; }, [updateLocationOverlay]);
@@ -314,18 +320,58 @@ export default function App() {
     });
   }, [clearMapObjects]);
 
-  const drawDetections = useCallback((items) => {
+  // ── 점자블록 장애물 마커 ──────────────────────────────────
+  // 서버 필드: markerLat/Lng, message, detections[0].label, level, status, timestamp
+  const drawTactileHazards = useCallback((items) => {
     if (!mapRef.current) return;
-    clearMapObjects(detectionMarkersRef);
-    const img = new window.kakao.maps.MarkerImage("https://t1.daumcdn.net/localimg/localimages/07/mapapidoc/markerStar.png", new window.kakao.maps.Size(24, 35));
-    items.slice(0, 40).forEach((entry) => {
-      const det = entry.detections?.[0];
-      if (!det) return;
-      const m = new window.kakao.maps.Marker({ map: mapRef.current, position: new window.kakao.maps.LatLng(entry.markerLat || entry.lat, entry.markerLng || entry.lng), title: det.label, image: img });
-      const iw = new window.kakao.maps.InfoWindow({ content: `<div style="padding:8px;font-size:12px;min-width:180px"><b>AI 감지</b><br/>${det.label} ${Math.round(det.confidence * 100)}%<br/>${det.direction} · ${det.distanceLevel}</div>` });
-      window.kakao.maps.event.addListener(m, "click", () => iw.open(mapRef.current, m));
-      detectionMarkersRef.current.push(m);
-    });
+    clearMapObjects(tactileHazardMarkersRef);
+
+    const svg = `<svg width="30" height="30" viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">
+      <polygon points="15,3 27,27 3,27" fill="#F97316" stroke="#7C2D12" stroke-width="2"/>
+      <text x="15" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="white">!</text>
+    </svg>`;
+    const markerImg = new window.kakao.maps.MarkerImage(
+      `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
+      new window.kakao.maps.Size(30, 30),
+      { offset: new window.kakao.maps.Point(15, 15) }
+    );
+
+    items
+      .filter((entry) => entry.status === "open")   // 방어: 혹시 섞여와도 open만
+      .slice(0, 50)
+      .forEach((entry) => {
+        const lat = entry.markerLat || entry.lat;
+        const lng = entry.markerLng || entry.lng;
+        if (!lat || !lng) return;
+
+        // 서버 새 필드 구조에 맞게 읽기
+        const primaryLabel = entry.detections?.[0]?.label;
+        const label        = KOREAN_OBJECT_LABELS[primaryLabel] || primaryLabel || "장애물";
+        const displayName  = entry.message || label;
+        const level        = entry.level || "";
+        const timestamp    = entry.timestamp
+          ? new Date(entry.timestamp).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })
+          : "";
+
+        const m = new window.kakao.maps.Marker({
+          map: mapRef.current,
+          position: new window.kakao.maps.LatLng(lat, lng),
+          title: displayName,
+          image: markerImg,
+        });
+        const iw = new window.kakao.maps.InfoWindow({
+          content: `<div style="padding:8px;font-size:12px;min-width:200px">
+            <b style="color:#ea580c">🔶 점자블록 장애물</b><br/>
+            <span style="font-size:14px;font-weight:bold">${displayName}</span><br/>
+            ${label !== displayName ? `<span style="font-size:11px;color:#555">분류: ${label}</span><br/>` : ""}
+            ${level     ? `<span style="font-size:11px">위험도: ${level}</span><br/>`   : ""}
+            ${timestamp ? `<span style="font-size:11px;color:#888">${timestamp}</span>` : ""}
+            ${entry.deviceId ? `<br/><span style="font-size:11px;color:#aaa">${entry.deviceId}</span>` : ""}
+          </div>`,
+        });
+        window.kakao.maps.event.addListener(m, "click", () => iw.open(mapRef.current, m));
+        tactileHazardMarkersRef.current.push(m);
+      });
   }, [clearMapObjects]);
 
   const drawSupportRequests = useCallback((items) => {
@@ -460,23 +506,23 @@ export default function App() {
   const [isClearing, setIsClearing] = useState(false);
 
   const clearAllMarkers = useCallback(async () => {
-    if (!window.confirm("AI 감지 기록과 긴급/도움 요청 기록을 모두 초기화할까요?\n(지도 마커 + 서버 로그 전부 삭제)")) return;
+    if (!window.confirm("점자블록 장애물 기록과 긴급/도움 요청 기록을 모두 초기화할까요?\n(지도 마커 + 서버 로그 전부 삭제)")) return;
     setIsClearing(true);
     try {
-      // 지도 마커 즉시 제거
-      clearMapObjects(detectionMarkersRef);
+      clearMapObjects(tactileHazardMarkersRef);
       clearMapObjects(supportMarkersRef);
-      setDetections([]);
       setSupportRequests([]);
+      prevHazardCountRef.current = 0;
 
-      // 서버 로그 삭제 (detections + emergency + support)
+      // tactile-hazards clear: 백엔드 admin_log_path에 타입 추가 필요
+      // 현재 백엔드에 없으면 404로 조용히 실패 (Promise.allSettled)
       await Promise.allSettled([
-        fetch(apiUrl("/api/admin/logs/clear?area=hwagok&type=detections"), { method: "POST" }),
-        fetch(apiUrl("/api/admin/logs/clear?area=hwagok&type=emergency"),  { method: "POST" }),
-        fetch(apiUrl("/api/admin/logs/clear?area=hwagok&type=support"),    { method: "POST" }),
+        fetch(apiUrl("/api/admin/logs/clear?area=hwagok&type=tactile-hazards"), { method: "POST" }),
+        fetch(apiUrl("/api/admin/logs/clear?area=hwagok&type=emergency"), { method: "POST" }),
+        fetch(apiUrl("/api/admin/logs/clear?area=hwagok&type=support"),   { method: "POST" }),
       ]);
 
-      setStatus("AI 감지 및 긴급 마커가 초기화되었습니다.");
+      setStatus("점자블록 장애물 및 긴급 마커가 초기화되었습니다.");
     } catch (err) {
       console.warn("초기화 실패", err);
       setStatus("초기화 중 오류가 발생했습니다.");
@@ -502,7 +548,6 @@ export default function App() {
         if (start) {
           setStatus("방송 요청을 앱으로 전송했습니다. 앱이 카메라를 켜면 자동으로 표시됩니다.");
           setStreamLog(`명령 전송 완료. 앱 pending: ${info.pendingCommandCount ?? "?"}개`);
-          // 앱 연결 대기 — active 될 때까지 2초마다 상태 폴링
           const checkActive = setInterval(async () => {
             try {
               const sr = await fetch(apiUrl("/api/control/stream/status"));
@@ -517,12 +562,10 @@ export default function App() {
               }
             } catch { /* 무시 */ }
           }, 2000);
-          // 30초 후 포기
           setTimeout(() => clearInterval(checkActive), 30000);
         } else {
           streamActiveRef.current = false;
           stopMjpeg();
-          // canvas 클리어
           const canvas = canvasRef.current;
           if (canvas) { const ctx = canvas.getContext("2d"); ctx.clearRect(0, 0, canvas.width, canvas.height); }
           setStreamLog("중지됨");
@@ -537,28 +580,36 @@ export default function App() {
   }, [startMjpeg, stopMjpeg]);
 
   // ── 백엔드 폴링 ─────────────────────────────────────────
-  // streamInfo를 ref로만 관리 → 이 함수의 의존성에서 제거 → 인터벌 재등록 루프 차단
   const refreshBackendData = useCallback(async () => {
     try {
-      const [rR, dR, sR, supR, stmR] = await Promise.all([
+      const [rR, hzR, sR, supR, stmR, locR] = await Promise.all([
         fetch(apiUrl("/api/risks?area=hwagok")),
-        fetch(apiUrl("/api/admin/detections?area=hwagok&limit=50")),
+        fetch(apiUrl("/api/admin/tactile-hazards?area=hwagok&limit=50&status=open")),
         fetch(apiUrl("/api/admin/summary?area=hwagok")),
         fetch(apiUrl("/api/admin/support-requests?area=hwagok&limit=20")),
         fetch(apiUrl("/api/control/stream/status")),
+        fetch(apiUrl("/api/mobile/location")),
       ]);
 
-      const anyOk = [rR, dR, sR].some((r) => r.ok);
+      const anyOk = [rR, hzR, sR].some((r) => r.ok);
       if (!anyOk) {
         if (backendAliveRef.current) { backendAliveRef.current = false; setStatus("백엔드 연결 실패. 서버를 확인해 주세요."); }
         return;
       }
       if (!backendAliveRef.current) { backendAliveRef.current = true; setStatus("백엔드에 재연결되었습니다."); }
 
-      const [rd, dd, sd, supd, stmd] = await Promise.all([safeJson(rR), safeJson(dR), safeJson(sR), safeJson(supR), safeJson(stmR)]);
+      const [rd, hzd, sd, supd, stmd, locd] = await Promise.all([
+        safeJson(rR), safeJson(hzR), safeJson(sR),
+        safeJson(supR), safeJson(stmR), safeJson(locR),
+      ]);
 
-      if (rd) { setRisks(rd.items || []); drawRiskMarkers(rd.items || []); }
-      if (dd) { setDetections(dd.items || []); drawDetections(dd.items || []); }
+      if (rd)   { setRisks(rd.items || []);             drawRiskMarkers(rd.items || []); }
+// 변경 후
+if (hzd)  {
+  const hazardItems = hzd.items || [];
+  drawTactileHazards(hazardItems);
+  prevHazardCountRef.current = hzd.count ?? hazardItems.length;
+}
       if (supd) { setSupportRequests(supd.items || []); drawSupportRequests(supd.items || []); }
 
       if (stmd?.stream) {
@@ -568,17 +619,26 @@ export default function App() {
         setStreamUiInfo({ ...next });
         setStreamLog(`백엔드: requested=${next.requested} active=${next.active}`);
 
-        // active false → true: 앱이 방금 연결됨 → MJPEG 시작
         if (next.active && !prev.active && !streamActiveRef.current) {
           streamActiveRef.current = true;
           setStreamLog("앱 연결 감지. 스트림 시작.");
           startMjpeg();
         }
-        // active true → false: 앱 연결 끊김 → MJPEG 중단
         if (!next.active && prev.active) {
           streamActiveRef.current = false;
           stopMjpeg();
           setStreamLog("앱 연결 끊김.");
+        }
+      }
+
+      if (locd?.ok && locd.lat != null && mobileLocModeRef.current === "mobile") {
+        const pt = { lat: locd.lat, lng: locd.lng };
+        mobilePosRef.current = pt;
+        const h = locd.heading ?? headingRef.current;
+        updateOverlayRef.current(pt, h);
+        if (!gpsCenteredRef.current) {
+          gpsCenteredRef.current = true;
+          if (mapRef.current) mapRef.current.setCenter(toLatLng(pt));
         }
       }
 
@@ -591,8 +651,7 @@ export default function App() {
     } catch {
       if (backendAliveRef.current) { backendAliveRef.current = false; setStatus("백엔드 연결 실패"); }
     }
-  // startMjpeg, stopMjpeg, triggerDangerAlert, drawXxx 만 의존 — streamInfo 제거
-  }, [drawDetections, drawRiskMarkers, drawSupportRequests, triggerDangerAlert, startMjpeg, stopMjpeg]);
+  }, [drawRiskMarkers, drawTactileHazards, drawSupportRequests, triggerDangerAlert, startMjpeg, stopMjpeg]);
 
   // ── 카카오맵 초기화 ───────────────────────────────────────
   useEffect(() => {
@@ -616,8 +675,10 @@ export default function App() {
               const point = { lat: pos.coords.latitude, lng: pos.coords.longitude };
               currentPosRef.current = point;
               setCurrentPosition(point);
-              updateOverlayRef.current(point, headingRef.current);
-              if (!gpsCenteredRef.current) { gpsCenteredRef.current = true; map.setCenter(toLatLng(point)); }
+              if (mobileLocModeRef.current === "browser") {
+                updateOverlayRef.current(point, headingRef.current);
+                if (!gpsCenteredRef.current) { gpsCenteredRef.current = true; map.setCenter(toLatLng(point)); }
+              }
             },
             (err) => { if (!gpsErrLoggedRef.current) { gpsErrLoggedRef.current = true; console.info("[GPS]", err.message); } },
             { enableHighAccuracy: true, maximumAge: 2000, timeout: 12000 }
@@ -722,9 +783,10 @@ export default function App() {
         <div className="metrics">
           <div><span>점자블록</span><strong>{summary?.tactileBlockCount ?? "-"}</strong></div>
           <div><span>위험 지점</span><strong>{summary?.riskCount ?? "-"}</strong></div>
-          <div><span>앱 감지</span><strong>{summary?.mobileDetectionLogCount ?? "-"}</strong></div>
+          <div><span>점자 장애물</span><strong>{summary?.tactileHazardCount ?? "-"}</strong></div>
           <div><span>긴급 호출</span><strong>{summary?.mobileEmergencyLogCount ?? "-"}</strong></div>
         </div>
+
         {/* ── 마커 초기화 버튼 ── */}
         <section style={{ paddingBottom: 0 }}>
           <button
@@ -741,14 +803,50 @@ export default function App() {
               justifyContent: "center", gap: "6px",
             }}
           >
-            {isClearing ? "⏳ 초기화 중..." : "🗑 AI 감지 · 긴급 마커 초기화"}
+            {isClearing ? "⏳ 초기화 중..." : "🗑 장애물 · 긴급 마커 초기화"}
           </button>
         </section>
 
         <section>
           <div className="section-title"><h2>현재 위치</h2></div>
-          <p className="plain" style={{ fontSize:"12px" }}>{`위도 ${currentPosition.lat.toFixed(5)}, 경도 ${currentPosition.lng.toFixed(5)}`}</p>
+          <div style={{ display:"flex", gap:"6px", marginBottom:"8px" }}>
+            <button
+              type="button"
+              onClick={() => setLocMode("mobile")}
+              style={{
+                flex:1, padding:"6px 8px", borderRadius:"6px", fontSize:"11px",
+                fontWeight:"bold", cursor:"pointer", border:"none",
+                background: locMode === "mobile" ? "#2563EB" : "#1f2937",
+                color: locMode === "mobile" ? "white" : "#9ca3af",
+              }}
+            >
+              📱 앱 GPS
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setLocMode("browser");
+                updateOverlayRef.current(currentPosRef.current, headingRef.current);
+              }}
+              style={{
+                flex:1, padding:"6px 8px", borderRadius:"6px", fontSize:"11px",
+                fontWeight:"bold", cursor:"pointer", border:"none",
+                background: locMode === "browser" ? "#2563EB" : "#1f2937",
+                color: locMode === "browser" ? "white" : "#9ca3af",
+              }}
+            >
+              💻 노트북 GPS
+            </button>
+          </div>
+          <p className="plain" style={{ fontSize:"11px", opacity:0.7 }}>
+            {locMode === "mobile"
+              ? mobilePosRef.current
+                ? `앱 위치: ${mobilePosRef.current.lat.toFixed(5)}, ${mobilePosRef.current.lng.toFixed(5)}`
+                : "앱 위치 수신 대기 중... (앱 실행 후 표시)"
+              : `노트북: ${currentPosition.lat.toFixed(5)}, ${currentPosition.lng.toFixed(5)}`}
+          </p>
         </section>
+
         <section>
           <div className="section-title"><h2>현재 목적지</h2></div>
           <p className="plain">
@@ -757,6 +855,7 @@ export default function App() {
               : "앱에서 목적지를 설정하거나 지도를 클릭하세요."}
           </p>
         </section>
+
         <section>
           <div className="section-title"><h2>추천 경로</h2><span>{routeCandidates.length}개</span></div>
           <div className="list">
@@ -772,6 +871,7 @@ export default function App() {
             ))}
           </div>
         </section>
+
         <section>
           <div className="section-title"><h2>지원 요청</h2><span>{supportRequests.filter((r) => r.status === "open").length} 활성</span></div>
           <div className="list compact">
@@ -792,6 +892,7 @@ export default function App() {
             ))}
           </div>
         </section>
+
         <section>
           <div className="section-title"><h2>위험 지점</h2><span>{risks.filter((r) => r.status === "open").length} open</span></div>
           <div className="list compact">
@@ -832,7 +933,6 @@ export default function App() {
                     style={{ padding:"6px", borderRadius:"4px", border:"1px solid #444", background:"#222", color:"#ccc", cursor:"pointer", fontSize:"11px" }}>
               🔄 화면 재연결 (스트림이 멈춘 경우)
             </button>
-            {/* canvas: MJPEG 프레임을 직접 렌더링 — img 무한로딩 버그 없음 */}
             <div style={{ width:"100%", aspectRatio:"4/3", background:"#000", borderRadius:"6px", overflow:"hidden", display:"flex", alignItems:"center", justifyContent:"center", position:"relative" }}>
               <canvas ref={canvasRef} style={{ width:"100%", height:"100%", objectFit:"cover", display: isStreamActive ? "block" : "none" }} />
               {!isStreamActive && (

@@ -111,6 +111,7 @@ yolo_model = None
 STREAM_SERVER_YOLO = os.getenv("BLINDCARE_STREAM_SERVER_YOLO", "").lower() in {"1", "true", "yes"}
 latest_control_destination: dict = {}
 latest_control_route: dict = {}
+latest_mobile_location: dict = {}
 latest_stream_status: dict = {
     "area": "hwagok",
     "deviceId": "demo-phone-01",
@@ -1423,7 +1424,33 @@ def get_nearby(
 
     return {"area": area, "items": sorted_items}
 
+class MobileLocationRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    lat: float
+    lng: float
+    heading: float | None = None
+    accuracy: float | None = None
 
+@app.post("/api/mobile/location")
+def update_mobile_location(payload: MobileLocationRequest):
+    global latest_mobile_location
+    latest_mobile_location = {
+        "ok": True,
+        "deviceId": payload.deviceId,
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "accuracy": payload.accuracy,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    return latest_mobile_location
+
+@app.get("/api/mobile/location")
+def get_mobile_location(area: str = "hwagok"):
+    if not latest_mobile_location:
+        return {"ok": False, "lat": None, "lng": None, "updatedAt": None}
+    return latest_mobile_location
 @app.post("/api/guidance")
 def create_guidance(payload: GuidanceRequest):
     next_step = payload.nextStep or {}
