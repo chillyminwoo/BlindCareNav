@@ -7,6 +7,7 @@ public class VoiceCommand {
         NEXT_GUIDANCE,
         NEARBY,
         RISK_INFO,
+        HELP,
         EMERGENCY,
         STOP_NAVIGATION,
         CURRENT_LOCATION,

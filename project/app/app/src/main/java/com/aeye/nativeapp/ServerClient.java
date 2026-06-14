@@ -10,6 +10,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 
 public class ServerClient {
@@ -29,10 +30,34 @@ public class ServerClient {
         public int durationMinute = 0;
         public String currentInstruction = "";
         public String nextInstruction = "";
+        
+        // 실시간 추적을 위해 추가되는 필드들
+        public List<LatLng> geometry = new ArrayList<>();
+        public List<RouteStep> steps = new ArrayList<>();
+    }
+
+    public static class LatLng {
+        public double lat;
+        public double lng;
+        public LatLng(double lat, double lng) { this.lat = lat; this.lng = lng; }
+    }
+
+    public static class RouteStep {
+        public String id;
+        public String type;
+        public String instruction;
+        public String direction;
+        public int distanceMeter;
+        public int startIndex; // geometry 리스트에서의 시작 인덱스
+        public int endIndex;   // geometry 리스트에서의 종료 인덱스
     }
 
     public interface AssistantCallback {
         void onResult(AssistantResult result);
+    }
+
+    public interface MobileCommandsCallback {
+        void onResult(MobileCommandsResult result);
     }
 
     public static class AssistantResult {
@@ -44,6 +69,14 @@ public class ServerClient {
         public String placeType = "";
         public String guidanceMode = "";
         public RouteResult route;
+    }
+
+    public static class MobileCommandsResult {
+        public boolean ok;
+        public final List<String> commands = new ArrayList<>();
+        public boolean streamRequested = false;
+        public boolean streamActive = false;
+        public String message = "";
     }
 
     private ServerClient() {
@@ -113,7 +146,7 @@ public class ServerClient {
             HttpURLConnection connection = null;
 
             try {
-                URL url = new URL(normalizedUrl + "/api/mobile/detections");
+                URL url = new URL(normalizedUrl + "/api/mobile/tactile-hazard");
                 connection = (HttpURLConnection) url.openConnection();
                 connection.setRequestMethod("POST");
                 connection.setConnectTimeout(4000);
@@ -140,6 +173,7 @@ public class ServerClient {
                     detectionObject.put("confidence", detection.confidence);
                     detectionObject.put("direction", toDirectionKey(detection.centerX));
                     detectionObject.put("distanceLevel", toDistanceLevelKey(detection.area()));
+                    detectionObject.put("isStaticObstacle", isStaticObstacleLabel(detection.label));
                     detectionArray.put(detectionObject);
                 }
 
@@ -296,51 +330,7 @@ public class ServerClient {
                     return;
                 }
 
-                JSONObject response = new JSONObject(responseBody);
-                result.ok = response.optBoolean("ok", false);
-
-                if (!result.ok) {
-                    result.reason = response.optString("reason", "목적지를 찾지 못했습니다.");
-                    callback.onResult(result);
-                    return;
-                }
-
-                JSONObject destination = response.optJSONObject("destination");
-                JSONObject summary = response.optJSONObject("summary");
-                JSONArray steps = response.optJSONArray("steps");
-
-                if (destination != null) {
-                    result.destinationName = destination.optString("name", destinationKeyword);
-                } else {
-                    result.destinationName = destinationKeyword;
-                }
-
-                if (summary != null) {
-                    result.distanceMeter = summary.optInt("distanceMeter", 0);
-                    result.durationMinute = summary.optInt("durationMinute", 0);
-                }
-
-                if (steps != null && steps.length() > 0) {
-                    JSONObject currentStep = steps.optJSONObject(0);
-                    JSONObject nextStep = steps.length() > 1 ? steps.optJSONObject(1) : null;
-
-                    if (currentStep != null) {
-                        result.currentInstruction = currentStep.optString("instruction", "직진 200m");
-                    }
-
-                    if (nextStep != null) {
-                        result.nextInstruction = nextStep.optString("instruction", "다음 안내를 준비 중입니다.");
-                    }
-                }
-
-                if (result.currentInstruction.isEmpty()) {
-                    result.currentInstruction = "직진 200m";
-                }
-
-                if (result.nextInstruction.isEmpty()) {
-                    result.nextInstruction = "다음 안내를 준비 중입니다.";
-                }
-
+                result = parseRouteResult(new JSONObject(responseBody), destinationKeyword);
                 callback.onResult(result);
             } catch (Exception error) {
                 result.reason = "경로 요청 실패: " + error.getMessage();
@@ -487,6 +477,7 @@ public class ServerClient {
                     detectionObject.put("confidence", detection.confidence);
                     detectionObject.put("direction", toDirectionKey(detection.centerX));
                     detectionObject.put("distanceLevel", toDistanceLevelKey(detection.area()));
+                    detectionObject.put("isStaticObstacle", isStaticObstacleLabel(detection.label));
                     detectionArray.put(detectionObject);
                 }
 
@@ -720,7 +711,7 @@ public class ServerClient {
             HttpURLConnection connection = null;
 
             try {
-                URL url = new URL(normalizedUrl + "/api/mobile/emergency");
+                URL url = new URL(normalizedUrl + "/api/support/emergency");
                 connection = (HttpURLConnection) url.openConnection();
                 connection.setRequestMethod("POST");
                 connection.setConnectTimeout(4000);
@@ -760,6 +751,222 @@ public class ServerClient {
         }).start();
     }
 
+    public static void postSupportRequest(
+            String baseUrl,
+            String type,
+            String deviceId,
+            double lat,
+            double lng,
+            Float heading,
+            String mode,
+            String sceneDescription,
+            List<Detection> detections,
+            String message,
+            Callback callback
+    ) {
+        new Thread(() -> {
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                callback.onResult("서버 주소가 비어 있어 관제 요청을 전송하지 못했습니다.");
+                return;
+            }
+
+            HttpURLConnection connection = null;
+            String requestType = "emergency".equals(type) ? "emergency" : "help";
+
+            try {
+                URL url = new URL(normalizedUrl + "/api/support/" + requestType);
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(4000);
+                connection.setReadTimeout(5000);
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                setTunnelHeaders(connection);
+
+                JSONObject payload = new JSONObject();
+                payload.put("area", "hwagok");
+                payload.put("deviceId", deviceId);
+                payload.put("lat", lat);
+                payload.put("lng", lng);
+                payload.put("heading", heading == null ? JSONObject.NULL : heading);
+                payload.put("mode", mode == null ? "general" : mode);
+                payload.put("sceneDescription", sceneDescription == null ? "" : sceneDescription);
+                payload.put("message", message == null ? "" : message);
+
+                JSONArray detectionArray = new JSONArray();
+                int count = Math.min(8, detections == null ? 0 : detections.size());
+
+                for (int index = 0; index < count; index += 1) {
+                    Detection detection = detections.get(index);
+                    JSONObject detectionObject = new JSONObject();
+                    detectionObject.put("label", detection.label);
+                    detectionObject.put("confidence", detection.confidence);
+                    detectionObject.put("direction", toDirectionKey(detection.centerX));
+                    detectionObject.put("distanceLevel", toDistanceLevelKey(detection.area()));
+                    detectionObject.put("isStaticObstacle", isStaticObstacleLabel(detection.label));
+                    detectionArray.put(detectionObject);
+                }
+
+                payload.put("detections", detectionArray);
+
+                byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
+
+                try (OutputStream outputStream = connection.getOutputStream()) {
+                    outputStream.write(body);
+                }
+
+                int status = connection.getResponseCode();
+
+                if (status >= 200 && status < 300) {
+                    callback.onResult("emergency".equals(requestType)
+                            ? "긴급 요청을 관제에 전송했습니다."
+                            : "도움 요청을 관제에 전송했습니다.");
+                } else {
+                    callback.onResult("관제 요청 전송 실패: HTTP " + status);
+                }
+            } catch (Exception error) {
+                callback.onResult("관제 요청 전송 실패: " + error.getMessage());
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
+    public static void fetchMobileCommands(
+            String baseUrl,
+            String deviceId,
+            MobileCommandsCallback callback
+    ) {
+        new Thread(() -> {
+            MobileCommandsResult result = new MobileCommandsResult();
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                callback.onResult(result);
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                String query = "?deviceId="
+                        + URLEncoder.encode(deviceId, StandardCharsets.UTF_8.name())
+                        + "&area=hwagok";
+                URL url = new URL(normalizedUrl + "/api/mobile/commands" + query);
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("GET");
+                connection.setConnectTimeout(3000);
+                connection.setReadTimeout(3000);
+                setTunnelHeaders(connection);
+
+                int status = connection.getResponseCode();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        status >= 200 && status < 300
+                                ? connection.getInputStream()
+                                : connection.getErrorStream(),
+                        StandardCharsets.UTF_8
+                ));
+                String responseBody = reader.readLine();
+
+                if (status < 200 || status >= 300 || responseBody == null) {
+                    callback.onResult(result);
+                    return;
+                }
+
+                JSONObject response = new JSONObject(responseBody);
+                result.ok = response.optBoolean("ok", false);
+
+                JSONArray commands = response.optJSONArray("commands");
+                if (commands != null) {
+                    for (int index = 0; index < commands.length(); index += 1) {
+                        JSONObject command = commands.optJSONObject(index);
+                        if (command != null) {
+                            result.commands.add(command.optString("type", ""));
+                        }
+                    }
+                }
+
+                JSONObject stream = response.optJSONObject("stream");
+                if (stream != null) {
+                    result.streamRequested = stream.optBoolean("requested", false);
+                    result.streamActive = stream.optBoolean("active", false);
+                    result.message = stream.optString("message", "");
+                }
+
+                callback.onResult(result);
+            } catch (Exception ignored) {
+                callback.onResult(result);
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
+    public static void postLocation(
+            String baseUrl,
+            String deviceId,
+            double lat,
+            double lng,
+            Float heading,
+            Callback callback
+    ) {
+        new Thread(() -> {
+            String normalizedUrl = normalizeBaseUrl(baseUrl);
+
+            if (normalizedUrl.isEmpty()) {
+                if (callback != null) callback.onResult("");
+                return;
+            }
+
+            HttpURLConnection connection = null;
+
+            try {
+                URL url = new URL(normalizedUrl + "/api/mobile/location");
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(3000);
+                connection.setReadTimeout(3000);
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                setTunnelHeaders(connection);
+
+                JSONObject payload = new JSONObject();
+                payload.put("area", "hwagok");
+                payload.put("deviceId", deviceId);
+                payload.put("lat", lat);
+                payload.put("lng", lng);
+                payload.put("heading", heading == null ? JSONObject.NULL : heading);
+
+                byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
+
+                try (OutputStream outputStream = connection.getOutputStream()) {
+                    outputStream.write(body);
+                }
+
+                int status = connection.getResponseCode();
+                if (callback != null) {
+                    if (status >= 200 && status < 300) {
+                        callback.onResult("OK");
+                    } else {
+                        callback.onResult("Error " + status);
+                    }
+                }
+            } catch (Exception error) {
+                if (callback != null) callback.onResult(error.getMessage());
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+        }).start();
+    }
+
     private static RouteResult parseRouteResult(JSONObject response, String fallbackKeyword) {
         RouteResult result = new RouteResult();
         result.ok = response.optBoolean("ok", false);
@@ -771,6 +978,7 @@ public class ServerClient {
 
         JSONObject destination = response.optJSONObject("destination");
         JSONObject summary = response.optJSONObject("summary");
+        JSONArray geometryArray = response.optJSONArray("geometry");
         JSONArray steps = response.optJSONArray("steps");
 
         if (destination != null) {
@@ -784,16 +992,52 @@ public class ServerClient {
             result.durationMinute = summary.optInt("durationMinute", 0);
         }
 
-        if (steps != null && steps.length() > 0) {
-            JSONObject currentStep = steps.optJSONObject(0);
-            JSONObject nextStep = steps.length() > 1 ? steps.optJSONObject(1) : null;
+        if (geometryArray != null) {
+            for (int i = 0; i < geometryArray.length(); i++) {
+                JSONObject point = geometryArray.optJSONObject(i);
 
-            if (currentStep != null) {
-                result.currentInstruction = currentStep.optString("instruction", "직진 200m");
+                if (point != null) {
+                    result.geometry.add(new LatLng(point.optDouble("lat"), point.optDouble("lng")));
+                }
+            }
+        }
+
+        if (steps != null && steps.length() > 0) {
+            for (int i = 0; i < steps.length(); i++) {
+                JSONObject stepObject = steps.optJSONObject(i);
+
+                if (stepObject == null) {
+                    continue;
+                }
+
+                RouteStep step = new RouteStep();
+                step.id = stepObject.optString("id", "step-" + (i + 1));
+                step.type = stepObject.optString("type", "");
+                step.direction = stepObject.optString("direction", "");
+                step.instruction = stepObject.optString("instruction", "");
+                step.distanceMeter = stepObject.optInt("distanceMeter", 0);
+                step.startIndex = stepObject.optInt("startIndex", 0);
+                step.endIndex = stepObject.optInt("endIndex", step.startIndex);
+
+                if (step.endIndex < step.startIndex) {
+                    step.endIndex = step.startIndex;
+                }
+
+                if (!result.geometry.isEmpty()) {
+                    int maxIndex = result.geometry.size() - 1;
+                    step.startIndex = Math.max(0, Math.min(step.startIndex, maxIndex));
+                    step.endIndex = Math.max(0, Math.min(step.endIndex, maxIndex));
+                }
+
+                result.steps.add(step);
             }
 
-            if (nextStep != null) {
-                result.nextInstruction = nextStep.optString("instruction", "다음 안내를 준비 중입니다.");
+            if (!result.steps.isEmpty()) {
+                result.currentInstruction = result.steps.get(0).instruction;
+            }
+
+            if (result.steps.size() > 1) {
+                result.nextInstruction = result.steps.get(1).instruction;
             }
         }
 
@@ -849,5 +1093,11 @@ public class ServerClient {
         }
 
         return "far";
+    }
+
+    private static boolean isStaticObstacleLabel(String label) {
+        if (label == null) return false;
+        // 사람과 점자블록은 마커 표시 대상에서 제외 (단순 안내용)
+        return !label.equals("person") && !label.equals("braille_block");
     }
 }

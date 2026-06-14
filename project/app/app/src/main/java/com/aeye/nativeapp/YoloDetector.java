@@ -21,7 +21,7 @@ import java.util.Comparator;
 import java.util.List;
 
 public class YoloDetector implements AutoCloseable {
-    public static final String MODEL_FILE = "blindcare_best_float32.tflite";
+    public static final String MODEL_FILE = "best_0610_float32.tflite";
     private static final String LABEL_FILE = "blindcare_labels.txt";
     private static final float SCORE_THRESHOLD = 0.45f;
     private static final float NMS_THRESHOLD = 0.45f;
@@ -96,48 +96,77 @@ public class YoloDetector implements AutoCloseable {
         boolean channelsFirst = first < second;
         int boxes = channelsFirst ? second : first;
         int channels = channelsFirst ? first : second;
-        boolean hasObjectness = channels == labels.size() + 5;
-        int classOffset = hasObjectness ? 5 : 4;
-        int classCount = Math.min(labels.size(), channels - classOffset);
+
         List<Detection> rawDetections = new ArrayList<>();
 
-        for (int boxIndex = 0; boxIndex < boxes; boxIndex += 1) {
-            float x = valueAt(output, channelsFirst, boxIndex, 0);
-            float y = valueAt(output, channelsFirst, boxIndex, 1);
-            float w = valueAt(output, channelsFirst, boxIndex, 2);
-            float h = valueAt(output, channelsFirst, boxIndex, 3);
-            float objectness = hasObjectness ? valueAt(output, channelsFirst, boxIndex, 4) : 1.0f;
+        // Handle E2E format [1, 300, 6] or [1, 6, 300]
+        // Typically [x1, y1, x2, y2, score, class_id]
+        if (channels == 6) {
+            for (int boxIndex = 0; boxIndex < boxes; boxIndex++) {
+                float x1 = valueAt(output, channelsFirst, boxIndex, 0);
+                float y1 = valueAt(output, channelsFirst, boxIndex, 1);
+                float x2 = valueAt(output, channelsFirst, boxIndex, 2);
+                float y2 = valueAt(output, channelsFirst, boxIndex, 3);
+                float score = valueAt(output, channelsFirst, boxIndex, 4);
+                int classIndex = (int) valueAt(output, channelsFirst, boxIndex, 5);
 
-            int bestClass = -1;
-            float bestScore = 0.0f;
-
-            for (int classIndex = 0; classIndex < classCount; classIndex += 1) {
-                float classScore = valueAt(output, channelsFirst, boxIndex, classOffset + classIndex);
-                float score = objectness * classScore;
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestClass = classIndex;
+                if (score < SCORE_THRESHOLD || classIndex < 0 || classIndex >= labels.size()) {
+                    continue;
                 }
+
+                float w = x2 - x1;
+                float h = y2 - y1;
+                float cx = x1 + w / 2.0f;
+                float cy = y1 + h / 2.0f;
+
+                rawDetections.add(new Detection(
+                        labels.get(classIndex),
+                        score,
+                        clamp(normalizeCoordinate(cx, inputWidth), 0.0f, 1.0f),
+                        clamp(normalizeCoordinate(cy, inputHeight), 0.0f, 1.0f),
+                        clamp(normalizeCoordinate(w, inputWidth), 0.0f, 1.0f),
+                        clamp(normalizeCoordinate(h, inputHeight), 0.0f, 1.0f)
+                ));
             }
+        } else {
+            // Original legacy format handling (e.g. YOLOv8 standard export)
+            boolean hasObjectness = channels == labels.size() + 5;
+            int classOffset = hasObjectness ? 5 : 4;
+            int classCount = Math.min(labels.size(), channels - classOffset);
 
-            if (bestClass < 0 || bestScore < SCORE_THRESHOLD) {
-                continue;
+            for (int boxIndex = 0; boxIndex < boxes; boxIndex += 1) {
+                float x = valueAt(output, channelsFirst, boxIndex, 0);
+                float y = valueAt(output, channelsFirst, boxIndex, 1);
+                float w = valueAt(output, channelsFirst, boxIndex, 2);
+                float h = valueAt(output, channelsFirst, boxIndex, 3);
+                float objectness = hasObjectness ? valueAt(output, channelsFirst, boxIndex, 4) : 1.0f;
+
+                int bestClass = -1;
+                float bestScore = 0.0f;
+
+                for (int classIndex = 0; classIndex < classCount; classIndex += 1) {
+                    float classScore = valueAt(output, channelsFirst, boxIndex, classOffset + classIndex);
+                    float score = objectness * classScore;
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestClass = classIndex;
+                    }
+                }
+
+                if (bestClass < 0 || bestScore < SCORE_THRESHOLD) {
+                    continue;
+                }
+
+                rawDetections.add(new Detection(
+                        labels.get(bestClass),
+                        bestScore,
+                        clamp(normalizeCoordinate(x, inputWidth), 0.0f, 1.0f),
+                        clamp(normalizeCoordinate(y, inputHeight), 0.0f, 1.0f),
+                        clamp(normalizeCoordinate(w, inputWidth), 0.0f, 1.0f),
+                        clamp(normalizeCoordinate(h, inputHeight), 0.0f, 1.0f)
+                ));
             }
-
-            float normalizedX = normalizeCoordinate(x, inputWidth);
-            float normalizedY = normalizeCoordinate(y, inputHeight);
-            float normalizedW = normalizeCoordinate(w, inputWidth);
-            float normalizedH = normalizeCoordinate(h, inputHeight);
-
-            rawDetections.add(new Detection(
-                    labels.get(bestClass),
-                    bestScore,
-                    clamp(normalizedX, 0.0f, 1.0f),
-                    clamp(normalizedY, 0.0f, 1.0f),
-                    clamp(normalizedW, 0.0f, 1.0f),
-                    clamp(normalizedH, 0.0f, 1.0f)
-            ));
         }
 
         rawDetections.sort(Comparator.comparing((Detection detection) -> detection.confidence).reversed());

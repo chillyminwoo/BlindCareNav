@@ -108,8 +108,20 @@ latest_processed_frame = None
 last_tts_time = 0.0
 tts_cooldown_second = 4.0
 yolo_model = None
+STREAM_SERVER_YOLO = os.getenv("BLINDCARE_STREAM_SERVER_YOLO", "").lower() in {"1", "true", "yes"}
 latest_control_destination: dict = {}
 latest_control_route: dict = {}
+latest_stream_status: dict = {
+    "area": "hwagok",
+    "deviceId": "demo-phone-01",
+    "requested": False,
+    "active": False,
+    "requestedBy": "",
+    "updatedAt": None,
+    "message": "",
+}
+latest_mobile_locations: dict[str, dict] = {}
+mobile_command_queues: dict[str, list[dict]] = {}
 cached_lmstudio_model: str | None = None
 lmstudio_disabled_until = 0.0
 
@@ -154,11 +166,40 @@ class EmergencyRequest(BaseModel):
     message: str = ""
 
 
+class SupportRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    lat: float
+    lng: float
+    heading: float | None = None
+    message: str = ""
+    mode: str = "general"
+    sceneDescription: str = ""
+    detections: list[dict] = Field(default_factory=list)
+
+
+class StreamControlRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    requestedBy: str = "control-web"
+    message: str = ""
+
+
 class DetectionItem(BaseModel):
     label: str
     confidence: float = 0.0
     direction: str = "front"
     distanceLevel: str = "unknown"
+    isStaticObstacle: bool = False
+
+class TactileHazardRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    lat: float
+    lng: float
+    heading: float | None = None
+    detections: list[DetectionItem] = Field(default_factory=list)
+    message: str = ""
 
 
 class MobileDetectionRequest(BaseModel):
@@ -169,6 +210,13 @@ class MobileDetectionRequest(BaseModel):
     heading: float | None = None
     detections: list[DetectionItem] = Field(default_factory=list)
     message: str = ""
+
+class MobileLocationRequest(BaseModel):
+    area: str = "hwagok"
+    deviceId: str = "demo-phone-01"
+    lat: float
+    lng: float
+    heading: float | None = None
 
 
 class ControlDestinationRequest(BaseModel):
@@ -228,6 +276,128 @@ def haversine_meter(lat1: float, lng1: float, lat2: float, lng2: float) -> int:
     return round(earth_radius_meter * c)
 
 
+def route_point(lat: float, lng: float) -> dict:
+    return {
+        "lat": round(float(lat), 7),
+        "lng": round(float(lng), 7),
+    }
+
+
+def direction_from_delta(start_lng: float, end_lng: float) -> str:
+    return "right" if end_lng >= start_lng else "left"
+
+
+def densify_route_points(points: list[dict], max_segment_meter: int = 35) -> list[dict]:
+    if len(points) <= 1:
+        return points
+
+    geometry: list[dict] = []
+
+    for index in range(len(points) - 1):
+        start = points[index]
+        end = points[index + 1]
+
+        if not geometry:
+            geometry.append(start)
+
+        segment_meter = haversine_meter(start["lat"], start["lng"], end["lat"], end["lng"])
+        split_count = max(1, segment_meter // max_segment_meter)
+
+        for split_index in range(1, split_count + 1):
+            ratio = split_index / split_count
+            geometry.append(
+                route_point(
+                    start["lat"] + (end["lat"] - start["lat"]) * ratio,
+                    start["lng"] + (end["lng"] - start["lng"]) * ratio,
+                )
+            )
+
+    return geometry
+
+
+def find_geometry_index(geometry: list[dict], point: dict) -> int:
+    for index, item in enumerate(geometry):
+        if item["lat"] == point["lat"] and item["lng"] == point["lng"]:
+            return index
+
+    return max(0, len(geometry) - 1)
+
+
+def build_demo_route_geometry_and_steps(start: Location, destination: dict, distance_meter: int):
+    start_point = route_point(start.lat, start.lng)
+    destination_point = route_point(destination["lat"], destination["lng"])
+
+    if distance_meter <= 60:
+        geometry = densify_route_points([start_point, destination_point])
+        end_index = max(0, len(geometry) - 1)
+        return geometry, [
+            {
+                "id": "step-1",
+                "type": "arrive",
+                "instruction": f"{destination['name']} 주변입니다. 주변 안전을 확인하세요.",
+                "distanceMeter": distance_meter,
+                "direction": "straight",
+                "startIndex": 0,
+                "endIndex": end_index,
+            }
+        ]
+
+    turn_point = route_point(start.lat, destination["lng"])
+    first_leg_meter = haversine_meter(start_point["lat"], start_point["lng"], turn_point["lat"], turn_point["lng"])
+    second_leg_meter = haversine_meter(turn_point["lat"], turn_point["lng"], destination_point["lat"], destination_point["lng"])
+
+    if first_leg_meter < 20 or second_leg_meter < 20:
+        geometry = densify_route_points([start_point, destination_point])
+        end_index = max(0, len(geometry) - 1)
+        return geometry, [
+            {
+                "id": "step-1",
+                "type": "straight",
+                "instruction": f"{destination['name']} 방향으로 이동하세요.",
+                "distanceMeter": distance_meter,
+                "direction": "straight",
+                "startIndex": 0,
+                "endIndex": end_index,
+            }
+        ]
+
+    geometry = densify_route_points([start_point, turn_point, destination_point])
+    turn_index = find_geometry_index(geometry, turn_point)
+    end_index = max(0, len(geometry) - 1)
+    turn_direction = direction_from_delta(start.lng, destination["lng"])
+    turn_label = DIRECTION_LABELS[turn_direction]
+
+    return geometry, [
+        {
+            "id": "step-1",
+            "type": "straight",
+            "instruction": f"{first_leg_meter}미터 직진하세요.",
+            "distanceMeter": first_leg_meter,
+            "direction": "straight",
+            "startIndex": 0,
+            "endIndex": turn_index,
+        },
+        {
+            "id": "step-2",
+            "type": f"turn_{turn_direction}",
+            "instruction": f"{turn_label}으로 방향을 바꾸세요.",
+            "distanceMeter": second_leg_meter,
+            "direction": turn_direction,
+            "startIndex": turn_index,
+            "endIndex": end_index,
+        },
+        {
+            "id": "step-3",
+            "type": "arrive",
+            "instruction": f"{destination['name']} 주변입니다. 주변 안전을 확인하세요.",
+            "distanceMeter": 0,
+            "direction": "straight",
+            "startIndex": end_index,
+            "endIndex": end_index,
+        },
+    ]
+
+
 def add_distance(item: dict, lat: float, lng: float) -> dict:
     distance_meter = haversine_meter(lat, lng, item["lat"], item["lng"])
 
@@ -244,6 +414,12 @@ def detection_log_path(area: str) -> Path:
 
     return DATA_DIR / f"mobile_detection_logs_{area}.jsonl"
 
+def tactile_hazard_log_path(area: str) -> Path:
+    if area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    return DATA_DIR / f"mobile_tactile_hazard_logs_{area}.jsonl"
+
 
 def emergency_log_path(area: str) -> Path:
     if area != "hwagok":
@@ -252,14 +428,34 @@ def emergency_log_path(area: str) -> Path:
     return DATA_DIR / f"mobile_emergency_logs_{area}.jsonl"
 
 
+def support_log_path(area: str) -> Path:
+    if area != "hwagok":
+        raise HTTPException(status_code=404, detail="Unsupported area")
+
+    return DATA_DIR / f"support_requests_{area}.jsonl"
+
+
 def admin_log_path(area: str, log_type: str) -> Path:
     normalized_type = normalize_keyword(log_type)
 
     if normalized_type in {"detections", "detection", "mobile_detections"}:
         return detection_log_path(area)
 
+    if normalized_type in {
+        "tactile-hazards",
+        "tactile_hazards",
+        "tactile-hazard",
+        "tactile_hazard",
+        "hazards",
+        "hazard",
+    }:
+        return tactile_hazard_log_path(area)
+
     if normalized_type in {"emergency", "emergencies", "mobile_emergency"}:
         return emergency_log_path(area)
+
+    if normalized_type in {"support", "supports", "help", "support_requests"}:
+        return support_log_path(area)
 
     raise HTTPException(status_code=400, detail="지원하지 않는 로그 타입입니다.")
 
@@ -290,6 +486,87 @@ def count_jsonl(path: Path) -> int:
 
     with path.open("r", encoding="utf-8") as log_file:
         return sum(1 for line in log_file if line.strip())
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_jsonl(path: Path, entry: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+
+    entries = []
+    with path.open("r", encoding="utf-8") as log_file:
+        for line in log_file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                entries.append({"raw": line, "parseError": True})
+    return entries
+
+
+def replace_jsonl(path: Path, entries: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as log_file:
+        for entry in entries:
+            log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def enqueue_mobile_command(device_id: str, command_type: str, payload: dict | None = None) -> dict:
+    command = {
+        "id": f"{command_type}-{int(time.time() * 1000)}",
+        "type": command_type,
+        "payload": payload or {},
+        "createdAt": utc_now(),
+    }
+    mobile_command_queues.setdefault(device_id, []).append(command)
+    return command
+
+
+def current_stream_snapshot() -> dict:
+    return {**latest_stream_status, "pendingCommandCount": sum(len(items) for items in mobile_command_queues.values())}
+
+
+def write_support_event(payload: SupportRequest, request_type: str) -> dict:
+    if payload.area != "hwagok":
+        raise HTTPException(status_code=404, detail="Unsupported area")
+
+    normalized_type = "emergency" if request_type == "emergency" else "help"
+    now = utc_now()
+    entry = {
+        "id": f"{normalized_type}-{int(time.time() * 1000)}",
+        "timestamp": now,
+        "updatedAt": now,
+        "area": payload.area,
+        "type": normalized_type,
+        "status": "open",
+        "priority": "critical" if normalized_type == "emergency" else "assist",
+        "deviceId": payload.deviceId,
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "mode": payload.mode,
+        "message": payload.message or ("Emergency request" if normalized_type == "emergency" else "Help request"),
+        "sceneDescription": payload.sceneDescription,
+        "detections": payload.detections[:8],
+        "mapUrl": f"https://maps.google.com/?q={payload.lat},{payload.lng}",
+    }
+    write_jsonl(support_log_path(payload.area), entry)
+    print(
+        f"[support-{normalized_type}] {payload.deviceId} {payload.lat},{payload.lng} {entry['message']}",
+        flush=True,
+    )
+    return entry
 
 
 def distance_level_to_meter(distance_level: str) -> int:
@@ -539,7 +816,7 @@ def lmstudio_base_url() -> str:
     raw = (
         os.getenv("BLINDCARE_OPENAI_BASE_URL")
         or os.getenv("BLINDCARE_LMSTUDIO_BASE_URL")
-        or "http://172.19.176.1:1234"
+        or "http://100.109.237.31:1234"
     ).strip()
 
     if not raw:
@@ -592,7 +869,7 @@ def get_lmstudio_model() -> str:
     return "local-model"
 
 
-def call_lmstudio_chat(messages: list[dict], timeout: float = 3.5, temperature: float = 0.2) -> str:
+def call_lmstudio_chat(messages: list[dict], timeout: float = 8.0, temperature: float = 0.2) -> str:
     global lmstudio_disabled_until
 
     if not assistant_llm_enabled():
@@ -681,17 +958,27 @@ def build_llm_command_hint(payload: AssistantCommandRequest, command_text: str) 
             "role": "system",
             "content": (
                 "너는 시각장애인 보행 내비게이션 앱 '누니'의 한국어 음성 명령 해석기다. "
-                "반드시 JSON 객체 하나만 출력한다. "
-                "허용 intent/action은 navigate/start_navigation, nearby/speak, risk_info/speak, "
-                "current_location/speak, detection_info/speak, safer_reroute/start_navigation, "
-                "start_streaming/start_streaming, stop_streaming/stop_streaming, "
-                "general_mode/set_guidance_mode, tactile_mode/set_guidance_mode, "
-                "emergency/emergency, stop_navigation/stop_navigation, repeat_guidance/repeat_guidance, "
-                "unknown/speak 이다. "
-                "목적지 안내라면 destinationKeyword를 장소명만 짧게 넣고, 주변시설이면 placeType을 "
-                "toilet/store/pharmacy/hospital/subway/cafe/restaurant/public_office 중 하나로 넣는다. "
-                "모드를 바꾸는 명령이면 guidanceMode를 general 또는 tactile로 넣는다. "
-                "확신이 없으면 unknown으로 둔다."
+                "반드시 JSON 객체 하나만 출력한다. 설명, 마크다운, 코드블록은 출력하지 않는다. "
+                "항상 intent, action, destinationKeyword, placeType, guidanceMode, tts 6개 키를 모두 포함한다. "
+                "값이 없으면 빈 문자열 \"\"로 둔다. "
+
+                "목적지로 가고 싶다는 말이면 intent=\"navigate\", action=\"start_navigation\"으로 둔다. "
+                "목적지 안내일 때 destinationKeyword에는 장소명만 넣는다. "
+                "예: '화곡 연세 의원 으로 안내 해줘'는 destinationKeyword=\"화곡연세의원\"이다. "
+
+                "주변 시설을 묻는 말이면 intent=\"nearby\", action=\"speak\"로 둔다. "
+                "주변 시설 종류가 있으면 placeType에 넣는다. "
+                "화장실=toilet, 편의점/마트/가게=store, 약국=pharmacy, 병원/의원=hospital, "
+                "지하철/역/출구=subway, 카페=cafe, 식당/밥집=restaurant, "
+                "주민센터/구청/동사무소=public_office. "
+
+                "'긴급' 한 단어만 있어도 emergency로 분류한다. "
+                "긴급, 긴급상황, 도와줘, 살려줘, 보호자, 119, SOS, 다쳤어는 "
+                "intent=\"emergency\", action=\"emergency\", tts=\"긴급 요청을 전달하겠습니다.\"로 둔다. "
+
+                "안내 종료, 그만, 멈춰는 intent=\"stop_navigation\", action=\"stop_navigation\"으로 둔다. "
+                "다시 말해줘, 반복, 한번 더는 intent=\"repeat_guidance\", action=\"repeat_guidance\"로 둔다. "
+                "알 수 없으면 intent=\"unknown\", action=\"speak\", tts=\"다시 말씀해 주세요.\"로 둔다."
             ),
         },
         {
@@ -713,36 +1000,12 @@ def build_llm_command_hint(payload: AssistantCommandRequest, command_text: str) 
             ),
         },
     ]
-    return extract_json_object(call_lmstudio_chat(messages, timeout=3.2, temperature=0.0))
+    raw = call_lmstudio_chat(messages, timeout=8.0, temperature=0.0)
+    print("[llm-raw]", raw, flush=True)
+    return extract_json_object(raw)
 
 
 def maybe_polish_assistant_message(intent: str, message: str, context: dict) -> str:
-    if not assistant_llm_enabled():
-        return message
-
-    prompt_context = json.dumps(context, ensure_ascii=False)[:1600]
-    polished = call_lmstudio_chat(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "너는 시각장애인 보행 내비게이션 음성 안내문을 만드는 비서다. "
-                    "새로운 사실을 만들지 말고, 제공된 문장과 컨텍스트만 사용한다. "
-                    "최종 안내문만 짧고 명확한 한국어로 출력한다."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"의도: {intent}\n안내문: {message}\n컨텍스트: {prompt_context}",
-            },
-        ],
-        timeout=2.5,
-        temperature=0.2,
-    )
-
-    if 0 < len(polished) <= 260:
-        return polished
-
     return message
 
 
@@ -880,16 +1143,7 @@ def build_mobile_route_response(area: str, keyword: str, current_location: Locat
         distance_meter = haversine_meter(start.lat, start.lng, destination["lat"], destination["lng"])
 
     duration_minute = max(1, round(distance_meter / 55))
-    first_distance = max(20, min(200, int(distance_meter)))
-    next_direction = "right" if destination["lng"] >= start.lng else "left"
-    next_label = DIRECTION_LABELS[next_direction]
-
-    if distance_meter <= 60:
-        current_instruction = f"{destination['name']} 주변입니다."
-        next_instruction = "도착 지점 주변 안전을 확인하세요."
-    else:
-        current_instruction = f"직진 {first_distance}m"
-        next_instruction = f"다음: {next_label}"
+    geometry, steps = build_demo_route_geometry_and_steps(start, destination, int(distance_meter))
 
     return {
         "ok": True,
@@ -909,18 +1163,8 @@ def build_mobile_route_response(area: str, keyword: str, current_location: Locat
             "durationMinute": duration_minute,
             "text": f"{destination['name']} · {distance_meter}m · 약 {duration_minute}분",
         },
-        "steps": [
-            {
-                "instruction": current_instruction,
-                "distanceMeter": first_distance,
-                "direction": "straight",
-            },
-            {
-                "instruction": next_instruction,
-                "distanceMeter": max(0, distance_meter - first_distance),
-                "direction": next_direction,
-            },
-        ],
+        "geometry": geometry,
+        "steps": steps,
     }
 
 
@@ -1063,16 +1307,18 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         if guidance_mode == "general":
             return response("general_mode", "set_guidance_mode", "일반 안내 모드로 전환하겠습니다.", guidanceMode="general")
 
-    if llm_action in {"start_streaming", "stop_streaming", "emergency", "stop_navigation", "repeat_guidance"}:
+    if llm_action in {"start_streaming", "stop_streaming", "help", "emergency", "stop_navigation", "repeat_guidance"}:
         message = str(llm_hint.get("tts", "")).strip()
         default_messages = {
-            "start_streaming": "관제 웹으로 카메라 스트리밍을 시작하겠습니다.",
-            "stop_streaming": "카메라 스트리밍을 중지하겠습니다.",
+            "start_streaming": "카메라 스트리밍은 관제에서 요청하면 자동으로 시작됩니다.",
+            "stop_streaming": "카메라 스트리밍은 관제에서 종료할 수 있습니다.",
+            "help": "도움 요청을 관제에 전달하겠습니다.",
             "emergency": "긴급 위치를 서버에 기록하고 보호자 전화 화면을 열겠습니다.",
             "stop_navigation": "안내를 종료하겠습니다.",
             "repeat_guidance": "현재 안내를 다시 읽겠습니다.",
         }
-        return response(llm_intent or llm_action, llm_action, message or default_messages[llm_action])
+        action = "speak" if llm_action in {"start_streaming", "stop_streaming"} else llm_action
+        return response(llm_intent or llm_action, action, message or default_messages[llm_action])
 
     if llm_intent == "nearby":
         place_type = str(llm_hint.get("placeType", "")).strip() or parse_assistant_place_type(command_text)
@@ -1095,7 +1341,14 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
             message = "현재 위치 정보가 아직 없습니다."
         return response("current_location", "speak", message)
 
-    if assistant_contains_any(command_text, "긴급", "보호자", "도와줘", "살려줘", "sos"):
+    if assistant_contains_any(command_text, "도움", "도와줘", "도와주세요", "막혔어", "길막힘"):
+        return response(
+            "help",
+            "help",
+            "도움 요청을 관제에 전달하겠습니다. 현재 위치와 최근 감지 정보를 함께 보냅니다.",
+        )
+
+    if assistant_contains_any(command_text, "긴급", "보호자", "살려줘", "다쳤어", "119", "sos"):
         return response(
             "emergency",
             "emergency",
@@ -1111,7 +1364,7 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         "영상 중지",
         "화면 전송 중지",
     ):
-        return response("stop_streaming", "stop_streaming", "카메라 스트리밍을 중지하겠습니다.")
+        return response("stop_streaming", "speak", "카메라 스트리밍은 관제에서 종료할 수 있습니다.")
 
     if assistant_contains_any(
         command_text,
@@ -1123,7 +1376,7 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         "화면 전송",
         "관제 전송",
     ):
-        return response("start_streaming", "start_streaming", "관제 웹으로 카메라 스트리밍을 시작하겠습니다.")
+        return response("start_streaming", "speak", "카메라 스트리밍은 관제에서 스트림 보기를 누르면 자동으로 시작됩니다.")
 
     if assistant_contains_any(command_text, "일반 안내 모드", "일반 모드", "일반 안내"):
         return response("general_mode", "set_guidance_mode", "일반 안내 모드로 전환하겠습니다.", guidanceMode="general")
@@ -1136,6 +1389,24 @@ def build_assistant_command_response(payload: AssistantCommandRequest):
         if destination_keyword:
             return navigation_response(destination_keyword, "safer_reroute")
         return response("safer_reroute", "speak", "현재 목적지가 없어 안전 경로를 다시 계산할 수 없습니다. 목적지를 먼저 말씀해 주세요.")
+
+    if assistant_contains_any(
+        command_text,
+        "안내해줘",
+        "안내해 줘",
+        "안내해 주세요",
+        "길 안내",
+        "경로 안내",
+        "찾아줘",
+        "찾아 줘",
+        "가자",
+        "가줘",
+        "가 줘",
+    ):
+        destination_keyword = clean_destination_keyword(command_text)
+        if destination_keyword:
+            return navigation_response(destination_keyword, "navigate")
+        return response("navigate", "listen", "목적지를 다시 말씀해 주세요.")
 
     if assistant_contains_any(command_text, "다시", "반복", "한번 더", "재생", "다시 읽어"):
         return response("repeat_guidance", "repeat_guidance", "현재 안내를 다시 읽겠습니다.")
@@ -1258,15 +1529,7 @@ def health_check():
         "dataDir": str(DATA_DIR),
         "yoloModelPath": str(MODEL_PATH),
         "yoloReady": YOLO is not None and MODEL_PATH.exists(),
-    }
-
-
-@app.get("/")
-def root():
-    return {
-        "service": "BlindCareNav backend",
-        "health": "/api/health",
-        "adminSummary": "/api/admin/summary?area=hwagok",
+        "streamServerYolo": STREAM_SERVER_YOLO,
     }
 
 
@@ -1350,6 +1613,41 @@ def create_mobile_route(payload: MobileRouteRequest):
 @app.post("/api/assistant/command")
 def handle_assistant_command(payload: AssistantCommandRequest):
     return build_assistant_command_response(payload)
+
+
+@app.get("/api/assistant/health")
+def get_assistant_health():
+    base_url = lmstudio_base_url()
+    enabled = assistant_llm_enabled()
+
+    if not enabled:
+        return {
+            "ok": True,
+            "llmEnabled": False,
+            "baseUrl": base_url,
+            "available": False,
+            "message": "LLM is disabled. Rule-based assistant fallback is active.",
+        }
+
+    try:
+        model = get_lmstudio_model()
+        return {
+            "ok": True,
+            "llmEnabled": True,
+            "baseUrl": base_url,
+            "available": True,
+            "model": model,
+            "message": "LM Studio/OpenAI-compatible assistant is reachable.",
+        }
+    except Exception as error:
+        return {
+            "ok": True,
+            "llmEnabled": True,
+            "baseUrl": base_url,
+            "available": False,
+            "model": None,
+            "message": f"LLM is not reachable. Rule-based fallback will be used. {error}",
+        }
 
 
 @app.post("/api/set_destination")
@@ -1483,6 +1781,7 @@ def get_admin_summary(area: str = "hwagok"):
     nearby_data = load_area_json(area, NEARBY_FILES, "주변시설 JSON")
     log_path = detection_log_path(area)
     emergency_path = emergency_log_path(area)
+    support_path = support_log_path(area)
 
     tactile_features = tactile_data.get("features", [])
     risks = risk_data.get("items", [])
@@ -1492,6 +1791,10 @@ def get_admin_summary(area: str = "hwagok"):
     danger_risks = [risk for risk in risks if risk.get("level") == "danger"]
     detection_log_count = count_jsonl(log_path)
     emergency_log_count = count_jsonl(emergency_path)
+    support_entries = read_jsonl(support_path)
+    open_support_entries = [entry for entry in support_entries if entry.get("status") == "open"]
+    help_support_entries = [entry for entry in support_entries if entry.get("type") == "help"]
+    emergency_support_entries = [entry for entry in support_entries if entry.get("type") == "emergency"]
 
     return {
         "area": area,
@@ -1503,6 +1806,10 @@ def get_admin_summary(area: str = "hwagok"):
         "nearbyPlaceCount": len(places),
         "mobileDetectionLogCount": detection_log_count,
         "mobileEmergencyLogCount": emergency_log_count,
+        "supportRequestCount": len(support_entries),
+        "openSupportRequestCount": len(open_support_entries),
+        "supportHelpCount": len(help_support_entries),
+        "supportEmergencyCount": len(emergency_support_entries),
     }
 
 
@@ -1528,6 +1835,167 @@ def search_places(payload: PlaceSearchRequest):
     return {"area": payload.area, "keyword": payload.keyword, "candidates": candidates}
 
 
+@app.post("/api/support/help")
+def create_support_help(payload: SupportRequest):
+    entry = write_support_event(payload, "help")
+    return {
+        "ok": True,
+        "message": "도움 요청을 관제에 전달했습니다.",
+        "entry": entry,
+    }
+
+
+@app.post("/api/support/emergency")
+def create_support_emergency(payload: SupportRequest):
+    entry = write_support_event(payload, "emergency")
+    emergency_entry = {
+        "timestamp": entry["timestamp"],
+        "area": payload.area,
+        "deviceId": payload.deviceId,
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "message": payload.message or "관제 긴급 요청",
+        "mapUrl": entry["mapUrl"],
+        "supportRequestId": entry["id"],
+    }
+    write_jsonl(emergency_log_path(payload.area), emergency_entry)
+    return {
+        "ok": True,
+        "message": "긴급 요청을 관제에 전달했습니다.",
+        "entry": entry,
+    }
+
+
+@app.get("/api/admin/support-requests")
+def get_admin_support_requests(area: str = "hwagok", type: str = "all", status: str = "all", limit: int = 50):
+    entries = list(reversed(read_jsonl(support_log_path(area))))
+    normalized_type = normalize_keyword(type)
+    normalized_status = normalize_keyword(status)
+
+    if normalized_type != "all":
+        entries = [entry for entry in entries if entry.get("type") == normalized_type]
+
+    if normalized_status != "all":
+        entries = [entry for entry in entries if entry.get("status") == normalized_status]
+
+    safe_limit = max(1, min(limit, 200))
+    return {
+        "area": area,
+        "count": len(entries),
+        "items": entries[:safe_limit],
+    }
+
+@app.get("/api/admin/tactile-hazards")
+def get_admin_tactile_hazards(area: str = "hwagok", limit: int = 50, status: str = "all"):
+    path = tactile_hazard_log_path(area)
+    safe_limit = max(1, min(limit, 200))
+    entries = list(reversed(read_jsonl_tail(path, safe_limit)))
+
+    normalized_status = normalize_keyword(status)
+
+    if normalized_status != "all":
+        entries = [
+            entry
+            for entry in entries
+            if entry.get("status") == normalized_status
+        ]
+
+    return {
+        "area": area,
+        "count": len(entries),
+        "items": entries,
+    }
+
+
+@app.post("/api/admin/support-requests/{request_id}/resolve")
+def resolve_admin_support_request(request_id: str, area: str = "hwagok", memo: str = ""):
+    path = support_log_path(area)
+    entries = read_jsonl(path)
+    found = None
+    now = utc_now()
+
+    for entry in entries:
+        if entry.get("id") == request_id:
+            entry["status"] = "resolved"
+            entry["resolvedAt"] = now
+            entry["adminMemo"] = memo
+            found = entry
+            break
+
+    if found is None:
+        raise HTTPException(status_code=404, detail="Support request not found")
+
+    replace_jsonl(path, entries)
+    return {"ok": True, "entry": found}
+
+
+@app.post("/api/control/stream/start")
+def request_control_stream_start(payload: StreamControlRequest):
+    latest_stream_status.update(
+        {
+            "area": payload.area,
+            "deviceId": payload.deviceId,
+            "requested": True,
+            "requestedBy": payload.requestedBy,
+            "updatedAt": utc_now(),
+            "message": payload.message or "Control web requested camera stream.",
+        }
+    )
+    command = enqueue_mobile_command(
+        payload.deviceId,
+        "start_stream",
+        {
+            "area": payload.area,
+            "message": "관제에서 카메라 스트리밍을 요청했습니다.",
+        },
+    )
+    return {"ok": True, "stream": current_stream_snapshot(), "command": command}
+
+
+@app.post("/api/control/stream/stop")
+def request_control_stream_stop(payload: StreamControlRequest):
+    global latest_processed_frame
+    latest_stream_status.update(
+        {
+            "area": payload.area,
+            "deviceId": payload.deviceId,
+            "requested": False,
+            "active": False,
+            "requestedBy": payload.requestedBy,
+            "updatedAt": utc_now(),
+            "message": payload.message or "Control web stopped camera stream.",
+        }
+    )
+    latest_processed_frame = None
+    command = enqueue_mobile_command(
+        payload.deviceId,
+        "stop_stream",
+        {
+            "area": payload.area,
+            "message": "관제에서 카메라 스트리밍을 종료했습니다.",
+        },
+    )
+    return {"ok": True, "stream": current_stream_snapshot(), "command": command}
+
+
+@app.get("/api/control/stream/status")
+def get_control_stream_status():
+    return {"ok": True, "stream": current_stream_snapshot()}
+
+
+@app.get("/api/mobile/commands")
+def get_mobile_commands(deviceId: str = "demo-phone-01", area: str = "hwagok"):
+    commands = mobile_command_queues.pop(deviceId, [])
+    return {
+        "ok": True,
+        "area": area,
+        "deviceId": deviceId,
+        "commands": commands,
+        "stream": current_stream_snapshot(),
+    }
+
+
 @app.post("/api/mobile/emergency")
 def create_mobile_emergency(payload: EmergencyRequest):
     if payload.area != "hwagok":
@@ -1548,6 +2016,22 @@ def create_mobile_emergency(payload: EmergencyRequest):
 
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    support_entry = write_support_event(
+        SupportRequest(
+            area=payload.area,
+            deviceId=payload.deviceId,
+            lat=payload.lat,
+            lng=payload.lng,
+            heading=payload.heading,
+            message=payload.message or "Mobile emergency request",
+            mode="emergency",
+            sceneDescription="",
+            detections=[],
+        ),
+        "emergency",
+    )
+    entry["supportRequestId"] = support_entry["id"]
 
     print(
         "[mobile-emergency]",
@@ -1614,6 +2098,144 @@ def create_mobile_detection(payload: MobileDetectionRequest):
         "markerEstimated": log_entry["markerEstimated"],
     }
 
+@app.post("/api/mobile/location")
+def update_mobile_location(payload: MobileLocationRequest):
+    if payload.area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    entry = {
+        "ok": True,
+        "area": payload.area,
+        "deviceId": payload.deviceId,
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "updatedAt": utc_now(),
+        "mapUrl": f"https://maps.google.com/?q={payload.lat},{payload.lng}",
+    }
+
+    latest_mobile_locations[payload.deviceId] = entry
+
+    print(
+        "[mobile-location] "
+        f"{payload.deviceId} {payload.lat},{payload.lng} heading={payload.heading}",
+        flush=True,
+    )
+
+    return entry
+
+
+@app.get("/api/mobile/location")
+def get_mobile_location(deviceId: str = "demo-phone-01", area: str = "hwagok"):
+    if area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    location = latest_mobile_locations.get(deviceId)
+
+    if not location:
+        return {
+            "ok": True,
+            "area": area,
+            "deviceId": deviceId,
+            "lat": None,
+            "lng": None,
+            "heading": None,
+            "updatedAt": None,
+            "message": "아직 수신된 위치 정보가 없습니다.",
+        }
+
+    return location
+
+
+@app.get("/api/mobile/locations")
+def get_mobile_locations(area: str = "hwagok"):
+    if area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    return {
+        "ok": True,
+        "area": area,
+        "items": list(latest_mobile_locations.values()),
+    }
+
+@app.post("/api/mobile/tactile-hazard")
+def create_mobile_tactile_hazard(payload: TactileHazardRequest):
+    if payload.area != "hwagok":
+        raise HTTPException(status_code=404, detail="지원하지 않는 구역입니다.")
+
+    hazard_detections = [
+        detection
+        for detection in payload.detections
+        if detection.label != "person"
+        and detection.label != "braille_block"
+        and detection.isStaticObstacle
+        and detection.confidence >= 0.45
+    ]
+
+    if not hazard_detections:
+        return {
+            "ok": True,
+            "stored": False,
+            "reason": "점자블록 위험 장애물 조건에 해당하는 감지가 없습니다.",
+        }
+
+    primary = hazard_detections[0]
+    marker_distance = distance_level_to_meter(primary.distanceLevel)
+    marker = estimate_marker_location(
+        payload.lat,
+        payload.lng,
+        payload.heading,
+        marker_distance,
+    )
+
+    now = utc_now()
+    log_entry = {
+        "id": f"tactile-hazard-{int(time.time() * 1000)}",
+        "timestamp": now,
+        "updatedAt": now,
+        "area": payload.area,
+        "deviceId": payload.deviceId,
+        "type": "tactile_hazard",
+        "status": "open",
+        "level": "danger",
+        "lat": payload.lat,
+        "lng": payload.lng,
+        "heading": payload.heading,
+        "markerLat": marker["lat"],
+        "markerLng": marker["lng"],
+        "markerEstimated": marker["estimated"],
+        "message": payload.message or "점자블록 위 장애물이 감지되었습니다.",
+        "detections": [
+            {
+                "label": detection.label,
+                "confidence": round(detection.confidence, 4),
+                "direction": detection.direction,
+                "distanceLevel": detection.distanceLevel,
+                "isStaticObstacle": detection.isStaticObstacle,
+            }
+            for detection in hazard_detections[:3]
+        ],
+        "mapUrl": f"https://maps.google.com/?q={marker['lat']},{marker['lng']}",
+    }
+
+    write_jsonl(tactile_hazard_log_path(payload.area), log_entry)
+
+    print(
+        "[tactile-hazard] "
+        f"{payload.deviceId} {primary.label} {primary.confidence:.2f} "
+        f"{primary.direction} {primary.distanceLevel} "
+        f"marker={log_entry['markerLat']},{log_entry['markerLng']}",
+        flush=True,
+    )
+
+    return {
+        "ok": True,
+        "stored": True,
+        "entry": log_entry,
+        "markerLat": log_entry["markerLat"],
+        "markerLng": log_entry["markerLng"],
+        "markerEstimated": log_entry["markerEstimated"],
+    }
 
 @app.get("/api/admin/detections")
 def get_admin_detections(area: str = "hwagok", limit: int = 50):
@@ -1650,9 +2272,6 @@ def clear_admin_logs(area: str = "hwagok", type: str = "detections"):
 
 @app.get("/video_feed")
 async def video_feed():
-    if YOLO is None or cv2 is None or np is None:
-        raise HTTPException(status_code=503, detail="YOLO stream dependencies are not installed.")
-
     return StreamingResponse(
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -1663,19 +2282,35 @@ async def video_feed():
 async def websocket_endpoint(websocket: WebSocket):
     global latest_processed_frame, last_tts_time
     await websocket.accept()
+    latest_stream_status.update(
+        {
+            "active": True,
+            "requested": True,
+            "updatedAt": utc_now(),
+            "message": "Smartphone stream connected.",
+        }
+    )
 
-    try:
-        model = get_yolo_model()
-    except Exception as error:
-        await websocket.send_text(f"YOLO 서버 준비 실패: {error}")
-        await websocket.close()
-        return
+    model = None
+
+    if STREAM_SERVER_YOLO:
+        try:
+            model = get_yolo_model()
+        except Exception as error:
+            await websocket.send_text(f"YOLO 서버 준비 실패: {error}")
+            await websocket.close()
+            return
 
     print("[mobile-stream] smartphone camera connected")
 
     try:
         while True:
             data = await websocket.receive_bytes()
+
+            if not STREAM_SERVER_YOLO:
+                latest_processed_frame = data
+                continue
+
             nparr = np.frombuffer(data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -1697,8 +2332,33 @@ async def websocket_endpoint(websocket: WebSocket):
             latest_processed_frame = buffer.tobytes()
     except WebSocketDisconnect:
         print("[mobile-stream] smartphone camera disconnected")
+        latest_stream_status.update(
+            {
+                "active": False,
+                "updatedAt": utc_now(),
+                "message": "Smartphone stream disconnected.",
+            }
+        )
     except Exception as error:
         print(f"[mobile-stream] processing error: {error}")
+        latest_stream_status.update(
+            {
+                "active": False,
+                "updatedAt": utc_now(),
+                "message": f"Smartphone stream error: {error}",
+            }
+        )
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "BlindCareNav backend",
+        "health": "/api/health",
+        "adminSummary": "/api/admin/summary?area=hwagok",
+        "supportRequests": "/api/admin/support-requests?area=hwagok",
+        "streamStatus": "/api/control/stream/status",
+    }
 
 
 if __name__ == "__main__":

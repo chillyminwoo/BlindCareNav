@@ -18,6 +18,7 @@ import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.media.AudioAttributes;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -73,9 +74,15 @@ import okio.ByteString;
 public class MainActivity extends ComponentActivity implements SensorEventListener {
     private enum Screen {
         HOME,
-        SEARCH,
-        NAVIGATION,
         SETTINGS
+    }
+
+    private enum VoiceMenuState {
+        NONE,
+        MAIN_MENU,
+        DESTINATION,
+        CONFIRM_DESTINATION,
+        NEARBY_TYPE
     }
 
     private static final int REQUEST_CAMERA_PERMISSION = 1001;
@@ -85,11 +92,26 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static final int REQUEST_VOICE_COMMAND = 2002;
     // Keep object detection calm enough for walking guidance and demo readability.
     private static final long ANALYSIS_INTERVAL_MS = 1500;
+    private static final long STREAM_FRAME_INTERVAL_MS = 220;
     private static final long SPEAK_INTERVAL_MS = 3000;
     private static final long POST_INTERVAL_MS = 2500;
+    private static final long MOBILE_COMMAND_POLL_INTERVAL_MS = 1500;
     private static final long SCENE_GUIDANCE_INTERVAL_MS = 12000;
     private static final long HAZARD_ALERT_COOLDOWN_MS = 5000;
+    private static final long GENERAL_HAZARD_SPEAK_INTERVAL_MS = 8000;
+    private static final long TACTILE_DEBUG_POST_INTERVAL_MS = 5000;
     private static final long VOICE_COMMAND_FOLLOW_UP_DELAY_MS = 2400;
+    private static final long BRAILLE_LOST_TIMEOUT_MS = 5000;
+    private static final int BRAILLE_STABLE_DETECTION_COUNT = 2;
+    private static final float TACTILE_IOU_THRESHOLD = 0.01f;
+    private static final float GENERAL_HAZARD_MIN_AREA = 0.035f;
+    private static final float BRAILLE_DETECTION_THRESHOLD = 0.50f;
+    private static final float TACTILE_OBSTACLE_SCORE_THRESHOLD = 0.35f;
+    private static final float TACTILE_EXPAND_X_RATIO = 0.38f;
+    private static final float TACTILE_EXPAND_Y_RATIO = 0.45f;
+    private static final float TACTILE_MIN_EXPANDED_HALF_WIDTH = 0.14f;
+    private static final float TACTILE_MIN_EXPANDED_HALF_HEIGHT = 0.10f;
+    private static final float TACTILE_EXPANDED_OBSTACLE_OVERLAP_THRESHOLD = 0.02f;
     private static final String PREF_NAME = "a-eye-native";
     private static final String PREF_SERVER_URL = "server-url";
     private static final String PREF_RECENT_DESTINATIONS = "recent-destinations";
@@ -101,8 +123,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static final String DEVICE_ID = "demo-phone-01";
 
     private static final int COLOR_BLUE = Color.rgb(24, 95, 165);
-    private static final int COLOR_BLUE_DARK = Color.rgb(13, 71, 124);
-    private static final int COLOR_BLUE_LIGHT = Color.rgb(230, 241, 251);
     private static final int COLOR_BACKGROUND = Color.rgb(247, 247, 243);
     private static final int COLOR_SURFACE = Color.rgb(242, 241, 236);
     private static final int COLOR_SURFACE_ALT = Color.rgb(250, 249, 244);
@@ -114,17 +134,13 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static final int COLOR_MUTED = Color.rgb(96, 96, 92);
     private static final int COLOR_NUNI_BLACK = Color.rgb(0, 0, 0);
     private static final int COLOR_NUNI_YELLOW = Color.rgb(255, 215, 0);
-    private static final int COLOR_NUNI_SURFACE = Color.rgb(24, 24, 20);
-    private static final int COLOR_NUNI_MUTED = Color.rgb(180, 176, 140);
 
     private final Set<String> riskLabels = new HashSet<>();
     private final Map<String, String> koreanLabels = new HashMap<>();
     private final VoiceCommandParser voiceCommandParser = new VoiceCommandParser();
     private final LocalLlmInterpreter localLlmInterpreter = new RuleBasedLocalLlmInterpreter();
 
-    private LinearLayout appRoot;
     private LinearLayout screenContainer;
-    private LinearLayout bottomNav;
     private TextView statusText;
     private TextView guideText;
     private TextView detectionText;
@@ -139,36 +155,43 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private TextToSpeech tts;
     private SpeechRecognizer speechRecognizer;
     private ProcessCameraProvider cameraProvider;
-    private GestureDetector navigationGestureDetector;
     private AlertDialog hazardDialog;
     private Handler mainHandler;
     private OkHttpClient streamHttpClient;
     private WebSocket streamWebSocket;
+    private RouteTracker routeTracker;
 
     private long lastAnalysisAt = 0L;
+    private long lastStreamedAt = 0L;
     private long lastSpokenAt = 0L;
     private long lastPostedAt = 0L;
     private long lastSceneGuidanceAt = 0L;
     private long lastHazardAlertAt = 0L;
+    private long lastGeneralHazardSpokenAt = 0L;
+    private long lastTactileDebugPostedAt = 0L;
+    private long lastBrailleDetectedAt = 0L;
     private long hazardSuppressedUntil = 0L;
+    private int brailleDetectionStreak = 0;
     private String lastHazardKey = "";
     private String lastGuideMessage = "누니야 하고 목적지를 말씀해 주세요.";
     private String lastServerStatusMessage = "서버 전송 대기 중";
     private String activeDestination = "";
-    private String routeChipMessage = "목적지를 설정하세요.";
     private String nextActionMessage = "직진 200m";
-    private String nextActionSubMessage = "다음: 우회전";
     private String nextPreviewMessage = "우회전 후 직진 500m";
     private boolean cameraRunning = false;
     private boolean navigationSessionActive = false;
-    private boolean pendingSearchSpeech = false;
     private boolean pendingVoiceCommandAfterPermission = false;
-    private boolean pendingDestinationSpeechAfterPermission = false;
     private boolean developerStreamingEnabled = false;
+    private boolean commandPollingActive = false;
     private boolean wakeListening = false;
     private boolean commandListening = false;
     private boolean voiceIntroSpoken = false;
+    private boolean isTtsSpeaking = false;
+    private float maxRmsDuringSession = -100f;
     private String guidanceMode = "general";
+    private String lastSceneDescription = "";
+    private String pendingDestinationConfirmation = "";
+    private VoiceMenuState voiceMenuState = VoiceMenuState.NONE;
     private Screen currentScreen = Screen.HOME;
     private SensorManager sensorManager;
     private Sensor rotationSensor;
@@ -176,11 +199,67 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private double currentLat = 37.54167;
     private double currentLng = 126.84028;
     private Float currentHeading = null;
+    private final List<Detection> lastDetectionsSnapshot = new ArrayList<>();
 
     private final LocationListener locationListener = location -> {
         currentLat = location.getLatitude();
         currentLng = location.getLongitude();
         runOnUiThread(this::updateLocationUi);
+        
+        // 경로 추적 및 안내 로직
+        if (navigationSessionActive && routeTracker != null) {
+            routeTracker.track(currentLat, currentLng, new RouteTracker.NavigationListener() {
+                @Override
+                public void onUpdate(String instruction, int remainingDistance) {
+                    runOnUiThread(() -> {
+                        updateGuide(instruction);
+                        speak(instruction, true);
+                    });
+                }
+
+                @Override
+                public void onStepCompleted(int nextStepIndex) {
+                    runOnUiThread(() -> {
+                        if (routeTracker == null) {
+                            return;
+                        }
+
+                        nextActionMessage = routeTracker.getCurrentInstruction();
+                        nextPreviewMessage = routeTracker.getNextInstruction();
+                        updateGuide(nextActionMessage);
+                        speak(lastGuideMessage, true);
+                    });
+                }
+
+                @Override
+                public void onOffRoute() {
+                    runOnUiThread(() -> {
+                        updateGuide("경로를 벗어났습니다. 경로를 다시 탐색합니다.");
+                        speak(lastGuideMessage, true);
+                        startNavigation(activeDestination); // 재탐색
+                    });
+                }
+
+                @Override
+                public void onArrival() {
+                    runOnUiThread(() -> {
+                        updateGuide("목적지에 도착했습니다. 안내를 종료합니다.");
+                        speak(lastGuideMessage, true);
+                        stopNavigation();
+                    });
+                }
+            });
+        }
+        
+        // 실시간 위치 정보를 서버로 전송
+        ServerClient.postLocation(
+                getServerUrl(),
+                DEVICE_ID,
+                currentLat,
+                currentLng,
+                currentHeading,
+                null
+        );
     };
 
     @Override
@@ -205,6 +284,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         setupDetector();
         setupSensors();
         setupLocation();
+        startMobileCommandPolling();
 
         if (!hasCameraPermission()) {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION);
@@ -216,60 +296,25 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     }
 
     private void setupUi() {
-        appRoot = new LinearLayout(this);
-        appRoot.setOrientation(LinearLayout.VERTICAL);
-        appRoot.setBackgroundColor(COLOR_BACKGROUND);
-
         screenContainer = new LinearLayout(this);
         screenContainer.setOrientation(LinearLayout.VERTICAL);
-        appRoot.addView(screenContainer, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-        ));
-
-        bottomNav = new LinearLayout(this);
-        bottomNav.setOrientation(LinearLayout.HORIZONTAL);
-        bottomNav.setGravity(Gravity.CENTER);
-        bottomNav.setPadding(dp(12), dp(8), dp(12), dp(10));
-        bottomNav.setBackgroundColor(Color.WHITE);
-        appRoot.addView(bottomNav, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        ));
-
-        setContentView(appRoot);
+        screenContainer.setBackgroundColor(COLOR_BACKGROUND);
+        setContentView(screenContainer);
         renderScreen(Screen.HOME, false);
     }
 
     private void renderScreen(Screen screen, boolean autoSpeech) {
         currentScreen = screen;
-        pendingSearchSpeech = autoSpeech;
         clearScreenRefs();
         screenContainer.removeAllViews();
 
         if (screen == Screen.HOME) {
             screenContainer.addView(buildHomeScreen());
-        } else if (screen == Screen.SEARCH) {
-            screenContainer.addView(buildSearchScreen());
-        } else if (screen == Screen.NAVIGATION) {
-            screenContainer.addView(buildNavigationScreen());
         } else {
             screenContainer.addView(buildSettingsScreen());
         }
 
-        renderBottomNav();
-        bottomNav.setVisibility(screen == Screen.HOME ? View.GONE : View.VISIBLE);
         updateLocationUi();
-
-        if (screen == Screen.SEARCH && pendingSearchSpeech) {
-            pendingSearchSpeech = false;
-            mainHandler.postDelayed(() -> {
-                if (currentScreen == Screen.SEARCH) {
-                    startVoiceCommandInput();
-                }
-            }, 350L);
-        }
     }
 
     private void clearScreenRefs() {
@@ -281,7 +326,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         serverInput = null;
         guardianInput = null;
         nuniWaveformView = null;
-        navigationGestureDetector = null;
     }
 
     private View buildHomeScreen() {
@@ -307,6 +351,25 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             root.addView(makeNuniStepDots());
         }
 
+        // 설정 버튼 (오른쪽 아래, 반전 색상)
+        Button settingsBtn = new Button(this);
+        settingsBtn.setText("⚙");
+        settingsBtn.setTextSize(24);
+        settingsBtn.setTextColor(COLOR_NUNI_BLACK);
+        settingsBtn.setPadding(0, 0, 0, 0);
+        settingsBtn.setGravity(Gravity.CENTER);
+        // 배경은 노란색 동그라미 (반전)
+        GradientDrawable shape = new GradientDrawable();
+        shape.setShape(GradientDrawable.OVAL);
+        shape.setColor(COLOR_NUNI_YELLOW);
+        settingsBtn.setBackground(shape);
+
+        FrameLayout.LayoutParams btnParams = new FrameLayout.LayoutParams(dp(56), dp(56));
+        btnParams.gravity = Gravity.BOTTOM | Gravity.END;
+        btnParams.setMargins(0, 0, dp(24), dp(24));
+        root.addView(settingsBtn, btnParams);
+        settingsBtn.setOnClickListener(v -> renderScreen(Screen.SETTINGS, false));
+
         statusText = new TextView(this);
         statusText.setText(lastServerStatusMessage);
         statusText.setVisibility(View.GONE);
@@ -324,117 +387,26 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         return root;
     }
 
-    private View buildSearchScreen() {
-        LinearLayout root = baseScreenContent();
-
-        root.addView(makeSmallTitle("② 목적지 입력"), margin(matchWrap(), 0, 0, 0, 12));
-
-        Button speechPanel = makeButton("🎙\n말씀하세요\n\"강남역 1번 출구\"\n\n듣는 중...", COLOR_BLUE, Color.WHITE);
-        speechPanel.setTextSize(22);
-        speechPanel.setMinHeight(dp(250));
-        speechPanel.setOnClickListener(view -> startVoiceCommandInput());
-        root.addView(speechPanel, margin(matchWrap(), 0, 0, 0, 18));
-
-        TextView recentTitle = makeSectionLabel("최근 목적지");
-        root.addView(recentTitle, margin(matchWrap(), 0, 0, 0, 8));
-
-        List<String> recentDestinations = getRecentDestinations();
-
-        if (recentDestinations.isEmpty()) {
-            TextView emptyText = makePanelText("최근 목적지가 없습니다.\n마이크 버튼을 눌러 목적지를 말해 주세요.", 17, COLOR_MUTED);
-            root.addView(emptyText, matchWrap());
-        } else {
-            for (String destination : recentDestinations) {
-                Button destinationButton = makeListButton(destination + "\n최근 목적지");
-                destinationButton.setOnClickListener(view -> startNavigation(destination));
-                root.addView(destinationButton, margin(matchWrap(), 0, 0, 0, 8));
-            }
-        }
-
-        return wrapScrollable(root);
-    }
-
-    private View buildNavigationScreen() {
-        LinearLayout root = baseScreenContent();
-        root.setOnTouchListener(this::handleNavigationTouch);
-        navigationGestureDetector = createNavigationGestureDetector();
-
-        TextView title = makeSmallTitle("③ 경로 안내 중");
-        root.addView(title, margin(matchWrap(), 0, 0, 0, 12));
-
-        TextView routeChip = makeChip(routeChipMessage);
-        routeChip.setTextColor(COLOR_TEXT);
-        root.addView(routeChip, margin(matchWrap(), 0, 0, 0, 14));
-
-        LinearLayout actionCard = new LinearLayout(this);
-        actionCard.setOrientation(LinearLayout.VERTICAL);
-        actionCard.setGravity(Gravity.CENTER);
-        actionCard.setPadding(dp(18), dp(22), dp(18), dp(22));
-        actionCard.setMinimumHeight(dp(220));
-        actionCard.setBackground(makeRoundedDrawable(COLOR_BLUE_LIGHT, COLOR_BLUE_LIGHT, dp(14)));
-        actionCard.setOnTouchListener(this::handleNavigationTouch);
-
-        TextView arrowText = new TextView(this);
-        arrowText.setText("↑");
-        arrowText.setTextColor(COLOR_BLUE);
-        arrowText.setTextSize(50);
-        arrowText.setTypeface(Typeface.DEFAULT_BOLD);
-        arrowText.setGravity(Gravity.CENTER);
-        actionCard.addView(arrowText, matchWrap());
-
-        guideText = new TextView(this);
-        guideText.setText(nextActionMessage);
-        guideText.setTextColor(COLOR_BLUE_DARK);
-        guideText.setTextSize(26);
-        guideText.setTypeface(Typeface.DEFAULT_BOLD);
-        guideText.setGravity(Gravity.CENTER);
-        actionCard.addView(guideText, margin(matchWrap(), 0, 4, 0, 4));
-
-        TextView subText = new TextView(this);
-        subText.setText(nextActionSubMessage);
-        subText.setTextColor(COLOR_BLUE);
-        subText.setTextSize(18);
-        subText.setGravity(Gravity.CENTER);
-        actionCard.addView(subText, matchWrap());
-
-        root.addView(actionCard, margin(matchWrap(), 0, 0, 0, 12));
-
-        TextView nextStepText = makePanelText("→ " + nextPreviewMessage, 17, COLOR_TEXT);
-        root.addView(nextStepText, margin(matchWrap(), 0, 0, 0, 14));
-
-        Button saveFavoriteButton = makeSecondaryButton("☆ 현재 목적지 즐겨찾기 저장", COLOR_TEXT);
-        saveFavoriteButton.setTextSize(16);
-        saveFavoriteButton.setOnClickListener(view -> saveActiveDestinationAsFavorite());
-        root.addView(saveFavoriteButton, margin(matchWrap(), 0, 0, 0, 12));
-
-        LinearLayout actionButtons = new LinearLayout(this);
-        actionButtons.setOrientation(LinearLayout.HORIZONTAL);
-
-        Button repeatButton = makeTileButton("🔊\n다시 읽기\n탭 또는 더블탭");
-        repeatButton.setOnClickListener(view -> speak(lastGuideMessage, true));
-        actionButtons.addView(repeatButton, weightedButtonParams(1f, 0, 0, 6, 0));
-
-        Button stopButton = makeButton("□\n안내 종료", Color.rgb(255, 238, 240), COLOR_DANGER);
-        stopButton.setMinHeight(dp(124));
-        stopButton.setOnClickListener(view -> stopNavigation());
-        actionButtons.addView(stopButton, weightedButtonParams(1f, 6, 0, 0, 0));
-
-        root.addView(actionButtons, margin(matchWrap(), 0, 0, 0, 14));
-
-        detectionText = makePanelText("카메라 감지 중\nGPS 연결 상태와 서버 전송 상태를 확인합니다.", 16, COLOR_MUTED);
-        root.addView(detectionText, margin(matchWrap(), 0, 0, 0, 8));
-
-        serverStatusText = makePanelText(lastServerStatusMessage, 15, COLOR_MUTED);
-        root.addView(serverStatusText, matchWrap());
-
-        return wrapScrollable(root);
-    }
-
     private View buildSettingsScreen() {
         SharedPreferences preferences = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
         LinearLayout root = baseScreenContent();
 
-        root.addView(makeSmallTitle("설정"), margin(matchWrap(), 0, 0, 0, 16));
+        // 상단 헤더 (제목 + 닫기 버튼)
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        
+        TextView title = makeSmallTitle("설정");
+        header.addView(title, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        
+        Button closeBtn = new Button(this);
+        closeBtn.setText("닫기");
+        closeBtn.setTextColor(COLOR_BLUE);
+        closeBtn.setBackground(null);
+        closeBtn.setOnClickListener(v -> renderScreen(Screen.HOME, false));
+        header.addView(closeBtn, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(48)));
+        
+        root.addView(header, margin(matchWrap(), 0, 0, 0, 16));
 
         root.addView(makeSectionLabel("TTS 속도"), margin(matchWrap(), 0, 0, 0, 6));
         TextView ttsRateText = makePanelText("", 16, COLOR_TEXT);
@@ -539,34 +511,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         return wrapScrollable(root);
     }
 
-    private void renderBottomNav() {
-        bottomNav.removeAllViews();
-        bottomNav.setBackgroundColor(currentScreen == Screen.HOME ? COLOR_NUNI_BLACK : Color.WHITE);
-        bottomNav.addView(makeNavButton("⌂\n홈", Screen.HOME), weightedButtonParams(1f, 0, 0, 4, 0));
-        bottomNav.addView(makeNavButton("⌕\n검색", Screen.SEARCH), weightedButtonParams(1f, 4, 0, 4, 0));
-
-        if (navigationSessionActive) {
-            bottomNav.addView(makeNavButton("↑\n안내", Screen.NAVIGATION), weightedButtonParams(1f, 4, 0, 4, 0));
-        }
-
-        bottomNav.addView(makeNavButton("⚙\n설정", Screen.SETTINGS), weightedButtonParams(1f, 4, 0, 0, 0));
-    }
-
-    private Button makeNavButton(String text, Screen targetScreen) {
-        boolean selected = currentScreen == targetScreen;
-        Button button = new Button(this);
-        button.setText(text);
-        button.setTextSize(13);
-        button.setTextColor(currentScreen == Screen.HOME
-                ? (selected ? COLOR_NUNI_YELLOW : COLOR_NUNI_MUTED)
-                : (selected ? COLOR_BLUE : COLOR_MUTED));
-        button.setTypeface(Typeface.DEFAULT_BOLD);
-        button.setAllCaps(false);
-        button.setMinHeight(dp(58));
-        button.setBackgroundColor(Color.TRANSPARENT);
-        button.setOnClickListener(view -> renderScreen(targetScreen, targetScreen == Screen.SEARCH));
-        return button;
-    }
+    private void renderBottomNav() { }
+    private View buildSearchScreen() { return null; }
+    private View buildNavigationScreen() { return null; }
+    private Button makeNavButton(String text, Screen targetScreen) { return null; }
 
     private void setupDetector() {
         try {
@@ -589,12 +537,57 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             if (status == TextToSpeech.SUCCESS) {
                 tts.setLanguage(Locale.KOREAN);
                 tts.setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build());
+
+                tts.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {
+                        isTtsSpeaking = true;
+                        runOnUiThread(() -> stopListeningImmediately());
+                    }
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        isTtsSpeaking = false;
+                        runOnUiThread(() -> {
+                            if (wakeListening || commandListening || voiceMenuState != VoiceMenuState.NONE) {
+                                mainHandler.postDelayed(() -> resumeListeningAfterTts(), 400L);
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {
+                        isTtsSpeaking = false;
+                    }
+                });
+
                 applyTtsRate(getSharedPreferences(PREF_NAME, MODE_PRIVATE).getInt(PREF_TTS_RATE, 95));
             }
         });
+    }
+
+    private void stopListeningImmediately() {
+        if (speechRecognizer != null) {
+            try {
+                speechRecognizer.cancel();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void resumeListeningAfterTts() {
+        if (isFinishing() || isTtsSpeaking) {
+            return;
+        }
+
+        if (voiceMenuState != VoiceMenuState.NONE) {
+            startVoiceCommandInput();
+        } else {
+            startWakeListening();
+        }
     }
 
     private void setupLabels() {
@@ -660,7 +653,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     }
 
     private void startNavigationFromStoredDestination(boolean favorite) {
-        String destination = "";
+        String destination;
 
         if (favorite) {
             destination = getSharedPreferences(PREF_NAME, MODE_PRIVATE).getString(PREF_FAVORITE_DESTINATION, "");
@@ -668,7 +661,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             if (destination == null || destination.trim().isEmpty()) {
                 updateGuide("즐겨찾기가 없습니다. 최근 목적지에서 선택하거나 새 목적지를 말해 주세요.");
                 speak(lastGuideMessage, true);
-                renderScreen(Screen.SEARCH, false);
                 return;
             }
 
@@ -681,11 +673,12 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         if (recent.isEmpty()) {
             updateGuide("최근 목적지가 없습니다. 목적지를 먼저 말해 주세요.");
             speak(lastGuideMessage, true);
-            renderScreen(Screen.SEARCH, true);
             return;
         }
 
-        renderScreen(Screen.SEARCH, false);
+        updateGuide("가장 최근 목적지인 " + recent.get(0) + " 안내를 시작합니다.");
+        speak(lastGuideMessage, true);
+        startNavigation(recent.get(0));
     }
 
     private void startNavigation(String destination) {
@@ -726,19 +719,21 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private void beginNavigation(ServerClient.RouteResult routeResult) {
         activeDestination = routeResult.destinationName;
         navigationSessionActive = true;
+        guidanceMode = "general";
+        lastGeneralHazardSpokenAt = 0L;
+        lastTactileDebugPostedAt = 0L;
+        resetBrailleAutoState();
         saveRecentDestination(activeDestination);
 
-        routeChipMessage = "→ "
-                + activeDestination
-                + " · "
-                + formatDistance(routeResult.distanceMeter)
-                + " · 약 "
-                + Math.max(1, routeResult.durationMinute)
-                + "분";
+        if (!routeResult.geometry.isEmpty() && !routeResult.steps.isEmpty()) {
+            routeTracker = new RouteTracker(routeResult);
+        } else {
+            routeTracker = null;
+        }
+
         nextActionMessage = routeResult.currentInstruction;
-        nextActionSubMessage = routeResult.nextInstruction;
         nextPreviewMessage = routeResult.nextInstruction + " → " + activeDestination;
-        lastGuideMessage = nextActionMessage + ". " + nextActionSubMessage;
+        lastGuideMessage = activeDestination + "까지 안내를 시작합니다. " + nextActionMessage;
 
         renderScreen(Screen.HOME, false);
         speak(lastGuideMessage, true);
@@ -754,7 +749,11 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         stopCamera();
         activeDestination = "";
         navigationSessionActive = false;
+        routeTracker = null;
         lastHazardKey = "";
+        lastGeneralHazardSpokenAt = 0L;
+        lastTactileDebugPostedAt = 0L;
+        resetBrailleAutoState();
         hazardSuppressedUntil = 0L;
 
         if (hazardDialog != null && hazardDialog.isShowing()) {
@@ -767,6 +766,62 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         scheduleWakeListening(1200L);
     }
 
+    private void startMobileCommandPolling() {
+        if (commandPollingActive) {
+            return;
+        }
+
+        commandPollingActive = true;
+        pollMobileCommands();
+    }
+
+    private void pollMobileCommands() {
+        if (!commandPollingActive || isFinishing()) {
+            return;
+        }
+
+        ServerClient.fetchMobileCommands(
+                getServerUrl(),
+                DEVICE_ID,
+                result -> runOnUiThread(() -> {
+                    if (result != null && result.ok) {
+                        for (String command : result.commands) {
+                            handleRemoteControlCommand(command);
+                        }
+
+                        if (result.streamRequested && !developerStreamingEnabled) {
+                            handleRemoteControlCommand("start_stream");
+                        } else if (!result.streamRequested && developerStreamingEnabled) {
+                            handleRemoteControlCommand("stop_stream");
+                        }
+                    }
+
+                    if (commandPollingActive && !isFinishing()) {
+                        mainHandler.postDelayed(this::pollMobileCommands, MOBILE_COMMAND_POLL_INTERVAL_MS);
+                    }
+                })
+        );
+    }
+
+    private void handleRemoteControlCommand(String command) {
+        if ("start_stream".equals(command) || "start_streaming".equals(command)) {
+            if (!developerStreamingEnabled) {
+                startDeveloperStreaming();
+                updateGuide("관제에서 카메라 스트리밍을 요청했습니다. 주변 화면을 전송합니다.");
+                speak(lastGuideMessage, true);
+            }
+            return;
+        }
+
+        if ("stop_stream".equals(command) || "stop_streaming".equals(command)) {
+            if (developerStreamingEnabled) {
+                stopDeveloperStreaming();
+                updateGuide("관제 카메라 스트리밍을 종료했습니다.");
+                speak(lastGuideMessage, true);
+            }
+        }
+    }
+
     private void startVoiceFirstIntro() {
         if (voiceIntroSpoken || isFinishing()) {
             return;
@@ -776,30 +831,9 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         startWakeListening();
     }
 
-    private void startVoiceDestinationInput() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            pendingDestinationSpeechAfterPermission = true;
-            pendingVoiceCommandAfterPermission = false;
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_AUDIO_PERMISSION);
-            return;
-        }
-
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR");
-        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "목적지를 말씀해 주세요.");
-
-        try {
-            startActivityForResult(intent, REQUEST_SPEECH_INPUT);
-        } catch (Exception error) {
-            updateGuide("이 기기에서는 음성 입력을 사용할 수 없습니다.");
-        }
-    }
-
     private void startVoiceCommandInput() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingVoiceCommandAfterPermission = true;
-            pendingDestinationSpeechAfterPermission = false;
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_AUDIO_PERMISSION);
             return;
         }
@@ -821,7 +855,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingVoiceCommandAfterPermission = true;
-            pendingDestinationSpeechAfterPermission = false;
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_AUDIO_PERMISSION);
             return;
         }
@@ -837,6 +870,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     }
 
     private void startSpeechRecognizer(boolean commandMode) {
+        if (isTtsSpeaking) {
+            return;
+        }
+
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             updateGuide("이 기기에서는 음성 인식을 사용할 수 없습니다.");
             return;
@@ -854,6 +891,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
             @Override
             public void onReadyForSpeech(Bundle params) {
+                maxRmsDuringSession = -100f; // 세션 시작 시 초기화
             }
 
             @Override
@@ -865,6 +903,9 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
             @Override
             public void onRmsChanged(float rmsdB) {
+                if (rmsdB > maxRmsDuringSession) {
+                    maxRmsDuringSession = rmsdB;
+                }
             }
 
             @Override
@@ -887,12 +928,19 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                     nuniWaveformView.setState(navigationSessionActive ? "navigating" : "idle");
                 }
 
+                // 에러 발생 시 즉시 재시작하지 않고 약간의 휴지기를 가짐 (무한 루프 방지)
                 if (commandMode) {
-                    updateGuide("잘 듣지 못했습니다. 누니야라고 다시 불러 주세요.");
+                    if (voiceMenuState != VoiceMenuState.NONE) {
+                        repromptVoiceMenu();
+                        return;
+                    }
+
+                    updateGuide("잘 듣지 못했습니다. 잠시 후 누니야라고 다시 불러 주세요.");
                     speak(lastGuideMessage, true);
-                    scheduleWakeListening(1600L);
+                    scheduleWakeListening(2500L); 
                 } else {
-                    scheduleWakeListening(700L);
+                    // 호출어 대기 중 에러(소음 등)는 조금 더 길게 대기 후 재시작
+                    scheduleWakeListening(1500L);
                 }
             }
 
@@ -902,6 +950,18 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 wakeListening = false;
                 ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                 String utterance = matches == null || matches.isEmpty() ? "" : matches.get(0);
+
+                // 소리 크기가 너무 작으면 (임계값 7.0 미만) 주변 소음으로 간주하고 무시
+                if (maxRmsDuringSession < 7.0f && !utterance.isEmpty()) {
+                    scheduleWakeListening(500L);
+                    return;
+                }
+
+                // 누니 자신의 음성 피드백 무시 로직
+                if (isSelfFeedback(utterance, lastGuideMessage)) {
+                    scheduleWakeListening(500L);
+                    return;
+                }
 
                 if (commandMode) {
                     if (utterance.trim().isEmpty()) {
@@ -932,6 +992,12 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR");
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+        // 마이크 소스를 통화용(7)으로 변경하여 노이즈 제거 강화
+        intent.putExtra("android.speech.extra.AUDIO_SOURCE", 7); 
+        // 침묵 감지 시간을 약간 더 여유 있게 조정
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, commandMode ? 4000L : 2000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, commandMode ? 2000L : 800L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, commandMode ? 1500L : 700L);
 
         try {
             speechRecognizer.startListening(intent);
@@ -939,6 +1005,31 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             updateGuide("이 기기에서는 음성 명령을 사용할 수 없습니다.");
             speak(lastGuideMessage, true);
         }
+    }
+
+    private boolean isSelfFeedback(String utterance, String lastSpoken) {
+        if (utterance == null || utterance.trim().isEmpty() || lastSpoken == null || lastSpoken.isEmpty()) {
+            return false;
+        }
+        
+        String cleanUtterance = utterance.replaceAll("\\s+", "");
+        String cleanLastSpoken = lastSpoken.replaceAll("\\s+", "");
+        
+        // 1. 단순 포함 관계 확인
+        if (cleanUtterance.length() > 3 && cleanLastSpoken.contains(cleanUtterance)) {
+            return true;
+        }
+        
+        // 2. 글자 수 대비 일치도 확인 (누니야 단어 제외)
+        int matchCount = 0;
+        for (int i = 0; i < Math.min(cleanUtterance.length(), cleanLastSpoken.length()); i++) {
+            if (cleanUtterance.charAt(i) == cleanLastSpoken.charAt(i)) {
+                matchCount++;
+            }
+        }
+        
+        float ratio = (float) matchCount / Math.max(cleanUtterance.length(), 1);
+        return ratio > 0.7f; // 70% 이상 일치하면 자가 피드백으로 간주
     }
 
     private void handleWakeResult(String utterance) {
@@ -949,14 +1040,343 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
         String command = removeWakeWord(utterance).trim();
 
+        // 명령어 텍스트가 조금이라도 있으면 무조건 서버(LLM)에 먼저 물어봅니다.
         if (!command.isEmpty()) {
             handleVoiceCommand(command);
             return;
         }
 
-        updateGuide("어떤 일을 할까요?");
+        // 아무 말 없이 "누니야"라고만 불렀을 때만 로컬 메뉴 로직으로 진입합니다.
+        enterVoiceMainMenu();
+    }
+
+    private void enterVoiceMainMenu() {
+        voiceMenuState = VoiceMenuState.MAIN_MENU;
+        pendingDestinationConfirmation = "";
+        updateGuide("네, 어떤 일을 할까요?");
         speak(lastGuideMessage, true);
-        mainHandler.postDelayed(this::startVoiceCommandInput, 1200L);
+        scheduleMenuListening(2200L); // 1500L에서 2200L로 연장
+    }
+
+    private void scheduleMenuListening(long delayMs) {
+        mainHandler.postDelayed(() -> {
+            if (!isFinishing() && voiceMenuState != VoiceMenuState.NONE) {
+                startVoiceCommandInput();
+            }
+        }, delayMs);
+    }
+
+    private boolean handleVoiceMenuCommand(String utterance) {
+        String normalized = normalizeVoiceToken(utterance);
+
+        if (normalized.isEmpty()) {
+            repromptVoiceMenu();
+            return true;
+        }
+
+        if (isCancelCommand(normalized)) {
+            voiceMenuState = VoiceMenuState.NONE;
+            updateGuide("메뉴를 종료했습니다. 다시 필요하면 누니야라고 불러 주세요.");
+            speak(lastGuideMessage, true);
+            scheduleWakeListening(2000L);
+            return true;
+        }
+
+        if (voiceMenuState == VoiceMenuState.MAIN_MENU) {
+            if (isDestinationMenuCommand(normalized)) {
+                voiceMenuState = VoiceMenuState.DESTINATION;
+                updateGuide("목적지를 말씀하세요. 예를 들어 화곡역 3번 출구라고 말하면 됩니다.");
+                speak(lastGuideMessage, true);
+                scheduleMenuListening(3400L);
+                return true;
+            }
+
+            if (isNearbyMenuCommand(normalized)) {
+                voiceMenuState = VoiceMenuState.NEARBY_TYPE;
+                updateGuide("주변시설을 찾습니다. 화장실, 편의점, 약국, 병원처럼 말씀하세요.");
+                speak(lastGuideMessage, true);
+                scheduleMenuListening(3500L);
+                return true;
+            }
+
+            if (isRiskMenuCommand(normalized)) {
+                voiceMenuState = VoiceMenuState.NONE;
+                readRiskInformation();
+                return true;
+            }
+
+            if (isEmergencyMenuCommand(normalized)) {
+                voiceMenuState = VoiceMenuState.NONE;
+                requestEmergencySupport();
+                return true;
+            }
+
+            if (isStreamingStartCommand(normalized)) {
+                voiceMenuState = VoiceMenuState.NONE;
+                updateGuide("카메라 스트리밍은 관제에서 스트림 보기를 누르면 자동으로 시작됩니다.");
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return true;
+            }
+
+            if (isStreamingStopCommand(normalized)) {
+                voiceMenuState = VoiceMenuState.NONE;
+                updateGuide("카메라 스트리밍은 관제에서 종료할 수 있습니다.");
+                speak(lastGuideMessage, true);
+                scheduleVoiceCommandFollowUp();
+                return true;
+            }
+
+            repromptVoiceMenu();
+            return true;
+        }
+
+        if (voiceMenuState == VoiceMenuState.DESTINATION) {
+            String destination = stripMenuFiller(utterance);
+
+            if (destination.length() < 2) {
+                updateGuide("목적지를 다시 말씀해 주세요.");
+                speak(lastGuideMessage, true);
+                scheduleMenuListening(2200L);
+                return true;
+            }
+
+            pendingDestinationConfirmation = destination;
+            voiceMenuState = VoiceMenuState.CONFIRM_DESTINATION;
+            updateGuide("목적지가 " + destination + " 맞습니까? 맞으면 맞아, 아니면 아니야라고 말씀하세요.");
+            speak(lastGuideMessage, true);
+            scheduleMenuListening(4300L);
+            return true;
+        }
+
+        if (voiceMenuState == VoiceMenuState.CONFIRM_DESTINATION) {
+            if (isYesCommand(normalized)) {
+                String destination = pendingDestinationConfirmation;
+                voiceMenuState = VoiceMenuState.NONE;
+                pendingDestinationConfirmation = "";
+                updateGuide(destination + " 안내를 시작합니다.");
+                speak(lastGuideMessage, true);
+                startNavigation(destination);
+                return true;
+            }
+
+            if (isNoCommand(normalized)) {
+                pendingDestinationConfirmation = "";
+                voiceMenuState = VoiceMenuState.DESTINATION;
+                updateGuide("알겠습니다. 목적지를 다시 말씀하세요.");
+                speak(lastGuideMessage, true);
+                scheduleMenuListening(2600L);
+                return true;
+            }
+
+            String destination = stripMenuFiller(utterance);
+            if (destination.length() >= 2) {
+                pendingDestinationConfirmation = destination;
+                updateGuide("목적지가 " + destination + " 맞습니까? 맞으면 맞아, 아니면 아니야라고 말씀하세요.");
+                speak(lastGuideMessage, true);
+                scheduleMenuListening(4300L);
+                return true;
+            }
+
+            updateGuide("맞으면 맞아, 아니면 아니야라고 말씀하세요.");
+            speak(lastGuideMessage, true);
+            scheduleMenuListening(2600L);
+            return true;
+        }
+
+        if (voiceMenuState == VoiceMenuState.NEARBY_TYPE) {
+            String placeType = parseMenuPlaceType(normalized);
+            voiceMenuState = VoiceMenuState.NONE;
+            readNearbyPlaces(placeType);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void repromptVoiceMenu() {
+        updateGuide("잘 듣지 못했습니다. 다시 말씀해 주세요.");
+        speak(lastGuideMessage, true);
+        scheduleMenuListening(2500L); // 2000L에서 2500L로 연장
+    }
+
+    private boolean looksLikeMenuCommand(String utterance) {
+        String normalized = normalizeVoiceToken(utterance);
+
+        if (normalized.length() <= 8 || normalized.contains("메뉴")) {
+            return isDestinationMenuCommand(normalized)
+                    || isNearbyMenuCommand(normalized)
+                    || isRiskMenuCommand(normalized)
+                    || isEmergencyMenuCommand(normalized)
+                    || isStreamingStartCommand(normalized)
+                    || isStreamingStopCommand(normalized);
+        }
+
+        return containsAnyToken(normalized, "목적지안내", "주변시설", "위험정보", "긴급연락", "도움", "도와줘", "스트리밍모드");
+    }
+
+    private String normalizeVoiceToken(String value) {
+        return value == null
+                ? ""
+                : value.toLowerCase(Locale.KOREA).replaceAll("\\s+", "");
+    }
+
+    private boolean containsAnyToken(String normalized, String... tokens) {
+        for (String token : tokens) {
+            if (normalized.contains(normalizeVoiceToken(token))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean isDestinationMenuCommand(String normalized) {
+        return containsAnyToken(
+                normalized,
+                "1",
+                "1번",
+                "일번",
+                "하나",
+                "첫번째",
+                "메뉴1",
+                "메뉴일",
+                "목적지",
+                "길안내",
+                "경로안내"
+        );
+    }
+
+    private boolean isNearbyMenuCommand(String normalized) {
+        return containsAnyToken(
+                normalized,
+                "2",
+                "2번",
+                "이번",
+                "둘",
+                "두번째",
+                "메뉴2",
+                "메뉴이",
+                "주변",
+                "근처",
+                "가까운",
+                "시설",
+                "화장실",
+                "편의점"
+        );
+    }
+
+    private boolean isRiskMenuCommand(String normalized) {
+        return containsAnyToken(
+                normalized,
+                "3",
+                "3번",
+                "삼번",
+                "셋",
+                "세번째",
+                "메뉴3",
+                "메뉴삼",
+                "위험",
+                "장애물"
+        );
+    }
+
+    private boolean isEmergencyMenuCommand(String normalized) {
+        return containsAnyToken(
+                normalized,
+                "4",
+                "4번",
+                "사번",
+                "넷",
+                "네번째",
+                "메뉴4",
+                "메뉴사",
+                "긴급",
+                "보호자",
+                "도와줘",
+                "도와주세요",
+                "도움",
+                "sos"
+        );
+    }
+
+    private boolean isStreamingStartCommand(String normalized) {
+        return containsAnyToken(normalized, "스트리밍켜", "스트리밍시작", "스트리밍모드켜", "카메라전송", "관제전송");
+    }
+
+    private boolean isStreamingStopCommand(String normalized) {
+        return containsAnyToken(normalized, "스트리밍꺼", "스트리밍중지", "스트리밍모드꺼", "카메라중지", "영상중지");
+    }
+
+    private boolean isCancelCommand(String normalized) {
+        return containsAnyToken(normalized, "취소", "그만", "메뉴종료", "닫아");
+    }
+
+    private boolean isYesCommand(String normalized) {
+        return containsAnyToken(normalized, "맞아", "맞습니다", "응", "네", "예", "그래", "확인", "좋아", "오케이", "ok");
+    }
+
+    private boolean isNoCommand(String normalized) {
+        return containsAnyToken(normalized, "아니", "아니야", "틀려", "다시", "재입력");
+    }
+
+    private String parseMenuPlaceType(String normalized) {
+        if (containsAnyToken(normalized, "화장실", "공중화장실", "화장")) {
+            return "toilet";
+        }
+
+        if (containsAnyToken(normalized, "편의점", "마트", "가게", "상점", "매장")) {
+            return "store";
+        }
+
+        if (containsAnyToken(normalized, "약국", "약방", "약")) {
+            return "pharmacy";
+        }
+
+        if (containsAnyToken(normalized, "병원", "의원", "의료")) {
+            return "hospital";
+        }
+
+        if (containsAnyToken(normalized, "지하철", "역", "출구", "전철")) {
+            return "subway";
+        }
+
+        if (containsAnyToken(normalized, "카페", "커피")) {
+            return "cafe";
+        }
+
+        if (containsAnyToken(normalized, "식당", "음식점", "밥집")) {
+            return "restaurant";
+        }
+
+        if (containsAnyToken(normalized, "주민센터", "관공서", "구청", "동사무소")) {
+            return "public_office";
+        }
+
+        return "";
+    }
+
+    private String stripMenuFiller(String utterance) {
+        String result = utterance == null ? "" : utterance.trim();
+        String[] fillers = {
+                "목적지",
+                "안내",
+                "안내해줘",
+                "안내해 줘",
+                "길 안내",
+                "경로 안내",
+                "찾아줘",
+                "가줘",
+                "가 줘",
+                "으로",
+                "로"
+        };
+
+        for (String filler : fillers) {
+            result = result.replace(filler, " ");
+        }
+
+        return result.replaceAll("\\s+", " ").trim();
     }
 
     private void scheduleWakeListening(long delayMs) {
@@ -987,6 +1407,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     }
 
     private void handleVoiceCommand(String utterance) {
+        if (voiceMenuState != VoiceMenuState.NONE && handleVoiceMenuCommand(utterance)) {
+            return;
+        }
+
         if (nuniWaveformView != null) {
             nuniWaveformView.setState("processing");
         }
@@ -1053,14 +1477,25 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 speak("다음 안내입니다. " + nextPreviewMessage, true);
                 scheduleVoiceCommandFollowUp();
                 return;
+            case "help":
+                requestControlHelp();
+                return;
             case "emergency":
-                openGuardianSms();
+                requestEmergencySupport();
                 return;
             case "stop_navigation":
                 stopNavigation();
                 return;
             case "set_guidance_mode":
                 guidanceMode = "tactile".equals(result.guidanceMode) ? "tactile" : "general";
+                lastHazardKey = "";
+                lastGeneralHazardSpokenAt = 0L;
+                lastTactileDebugPostedAt = 0L;
+                resetBrailleAutoState();
+                if ("tactile".equals(guidanceMode)) {
+                    lastBrailleDetectedAt = System.currentTimeMillis();
+                }
+                hazardSuppressedUntil = System.currentTimeMillis() + 2500L;
                 updateGuide(result.message.isEmpty()
                         ? ("tactile".equals(guidanceMode) ? "점자 안내 모드로 전환했습니다." : "일반 안내 모드로 전환했습니다.")
                         : result.message);
@@ -1083,14 +1518,12 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 startMostRecentDestination();
                 return;
             case "start_streaming":
-                startDeveloperStreaming();
-                updateGuide(result.message.isEmpty() ? "관제 웹으로 카메라 스트리밍을 시작했습니다." : result.message);
+                updateGuide(result.message.isEmpty() ? "카메라 스트리밍은 관제에서 스트림 보기를 누르면 자동으로 시작됩니다." : result.message);
                 speak(lastGuideMessage, true);
                 scheduleVoiceCommandFollowUp();
                 return;
             case "stop_streaming":
-                stopDeveloperStreaming();
-                updateGuide(result.message.isEmpty() ? "카메라 스트리밍을 중지했습니다." : result.message);
+                updateGuide(result.message.isEmpty() ? "카메라 스트리밍은 관제에서 종료할 수 있습니다." : result.message);
                 speak(lastGuideMessage, true);
                 scheduleVoiceCommandFollowUp();
                 return;
@@ -1139,8 +1572,11 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             case RISK_INFO:
                 readRiskInformation();
                 return;
+            case HELP:
+                requestControlHelp();
+                return;
             case EMERGENCY:
-                openGuardianSms();
+                requestEmergencySupport();
                 return;
             case STOP_NAVIGATION:
                 stopNavigation();
@@ -1166,14 +1602,12 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 startMostRecentDestination();
                 return;
             case START_STREAMING:
-                startDeveloperStreaming();
-                updateGuide("관제 웹으로 카메라 스트리밍을 시작했습니다.");
+                updateGuide("카메라 스트리밍은 관제에서 스트림 보기를 누르면 자동으로 시작됩니다.");
                 speak(lastGuideMessage, true);
                 scheduleVoiceCommandFollowUp();
                 return;
             case STOP_STREAMING:
-                stopDeveloperStreaming();
-                updateGuide("카메라 스트리밍을 중지했습니다.");
+                updateGuide("카메라 스트리밍은 관제에서 종료할 수 있습니다.");
                 speak(lastGuideMessage, true);
                 scheduleVoiceCommandFollowUp();
                 return;
@@ -1268,39 +1702,50 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         speak(lastGuideMessage, true);
     }
 
-    private void openGuardianSms() {
-        SharedPreferences preferences = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
-        String phone = preferences.getString(PREF_GUARDIAN_PHONE, "");
-        String message = "A-eye 긴급 위치 공유\n현재 위치: "
-                + String.format(Locale.KOREA, "%.6f, %.6f", currentLat, currentLng)
-                + "\n지도: https://maps.google.com/?q=" + currentLat + "," + currentLng;
+    private List<Detection> getLastDetectionSnapshot() {
+        return new ArrayList<>(lastDetectionsSnapshot);
+    }
 
-        ServerClient.postEmergency(
+    private void requestControlHelp() {
+        String message = "사용자가 관제 도움을 요청했습니다. 보행로 장애물로 인한 이동 불가능 상황이 의심됩니다.";
+        ServerClient.postSupportRequest(
                 getServerUrl(),
+                "help",
                 DEVICE_ID,
                 currentLat,
                 currentLng,
                 currentHeading,
+                guidanceMode,
+                lastSceneDescription,
+                getLastDetectionSnapshot(),
                 message,
                 result -> runOnUiThread(() -> setServerStatus(result))
         );
 
-        if (phone == null || phone.trim().isEmpty()) {
-            updateGuide("보호자 번호가 없습니다. 설정에서 보호자 번호를 입력하세요.");
-            speak(lastGuideMessage, true);
-            return;
-        }
+        updateGuide("관제에 도움을 요청했습니다. 장면을 확인 중이니 잠시만 기다려 주세요. 주변 인력 출동이 필요한지 확인하겠습니다.");
+        speak(lastGuideMessage, true);
+        scheduleVoiceCommandFollowUp();
+    }
 
-        Intent intent = new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(phone.trim())));
+    private void requestEmergencySupport() {
+        String message = "사용자 긴급 상황 발생! 부상 또는 사고가 의심됩니다. 119 지원이 필요할 수 있습니다.";
+        ServerClient.postSupportRequest(
+                getServerUrl(),
+                "emergency",
+                DEVICE_ID,
+                currentLat,
+                currentLng,
+                currentHeading,
+                guidanceMode,
+                lastSceneDescription,
+                getLastDetectionSnapshot(),
+                message,
+                result -> runOnUiThread(() -> setServerStatus(result))
+        );
 
-        try {
-            startActivity(intent);
-            updateGuide("긴급 위치를 서버에 전송하고 보호자 전화 화면을 열었습니다.");
-            speak(lastGuideMessage, true);
-        } catch (Exception error) {
-            updateGuide("전화 앱을 열 수 없습니다. 설정에서 보호자 번호를 확인하세요.");
-            speak(lastGuideMessage, true);
-        }
+        updateGuide("긴급 상황이 접수되었습니다. 관제 센터에서 즉시 119에 구조를 요청하겠습니다. 안전한 곳에서 잠시만 기다려 주세요.");
+        speak(lastGuideMessage, true);
+        scheduleVoiceCommandFollowUp();
     }
 
     private void startCamera() {
@@ -1430,7 +1875,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         try {
             Bitmap scaled = Bitmap.createScaledBitmap(bitmap, 320, 240, true);
             ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            scaled.compress(Bitmap.CompressFormat.JPEG, 40, outputStream);
+            scaled.compress(Bitmap.CompressFormat.JPEG, 35, outputStream);
             streamWebSocket.send(ByteString.of(outputStream.toByteArray()));
         } catch (Exception error) {
             runOnUiThread(() -> setServerStatus("스트리밍 프레임 전송 실패: " + error.getMessage()));
@@ -1440,17 +1885,32 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private void analyzeImage(ImageProxy imageProxy) {
         try {
             long now = System.currentTimeMillis();
+            boolean shouldStream = developerStreamingEnabled
+                    && streamWebSocket != null
+                    && now - lastStreamedAt >= STREAM_FRAME_INTERVAL_MS;
+            boolean shouldAnalyze = now - lastAnalysisAt >= ANALYSIS_INTERVAL_MS;
 
-            if (now - lastAnalysisAt < ANALYSIS_INTERVAL_MS) {
+            if (!shouldStream && !shouldAnalyze) {
+                return;
+            }
+
+            Bitmap bitmap = ImageUtils.imageProxyToBitmap(imageProxy);
+            Bitmap rotatedBitmap = ImageUtils.rotateBitmap(bitmap, imageProxy.getImageInfo().getRotationDegrees());
+
+            if (shouldStream) {
+                lastStreamedAt = now;
+                maybeSendStreamingFrame(rotatedBitmap);
+            }
+
+            if (!shouldAnalyze) {
                 return;
             }
 
             lastAnalysisAt = now;
-            Bitmap bitmap = ImageUtils.imageProxyToBitmap(imageProxy);
-            Bitmap rotatedBitmap = ImageUtils.rotateBitmap(bitmap, imageProxy.getImageInfo().getRotationDegrees());
-            maybeSendStreamingFrame(rotatedBitmap);
             List<Detection> detections = detector.detect(rotatedBitmap);
             List<Detection> riskDetections = filterRiskDetections(detections);
+            List<Detection> tactileRiskDetections = filterTactileRiskDetections(detections);
+            List<Detection> brailleBlocks = filterBrailleBlocks(detections);
             String detectionSummary = buildDetectionSummary(detections);
 
             runOnUiThread(() -> {
@@ -1458,23 +1918,35 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                     detectionText.setText(detectionSummary);
                 }
 
-                if (!riskDetections.isEmpty()) {
-                    Detection primary = riskDetections.get(0);
-                    String guideMessage = buildGuideMessage(primary);
-                    maybePostDetection(riskDetections, guideMessage);
+                updateAutomaticGuidanceMode(brailleBlocks, now);
 
-                    if (navigationSessionActive && "tactile".equals(guidanceMode) && hasDetectedBrailleBlock(detections)) {
-                        speakHazardWithoutDialog(primary, buildTactileGuideMessage(primary));
-                    } else if (!navigationSessionActive) {
-                        updateGuide(guideMessage);
-                        speakThrottled(guideMessage);
+                boolean tactileModeActive = navigationSessionActive && "tactile".equals(guidanceMode);
+                List<Detection> activeRiskDetections = tactileModeActive ? tactileRiskDetections : riskDetections;
+                Detection tactileObstacle = findObstacleOnBrailleBlock(brailleBlocks, tactileRiskDetections);
+                maybePostTactileDebug(brailleBlocks, tactileRiskDetections, tactileObstacle);
+
+                if (!activeRiskDetections.isEmpty()) {
+                    Detection primary = activeRiskDetections.get(0);
+                    String guideMessage = buildGuideMessage(primary);
+                    maybePostDetection(activeRiskDetections, guideMessage);
+
+                    if (tactileModeActive) {
+                        if (tactileObstacle != null) {
+                            speakHazardWithoutDialog(tactileObstacle, buildTactileGuideMessage(tactileObstacle));
+                        }
+                    } else {
+                        speakGeneralHazards(activeRiskDetections);
                     }
                 }
 
                 if (navigationSessionActive && now - lastSceneGuidanceAt >= SCENE_GUIDANCE_INTERVAL_MS) {
                     lastSceneGuidanceAt = now;
 
-                    if (!"tactile".equals(guidanceMode) || hasDetectedBrailleBlock(detections)) {
+                    if (tactileModeActive) {
+                        if (tactileObstacle != null) {
+                            requestSceneGuidance(detections);
+                        }
+                    } else {
                         requestSceneGuidance(detections);
                     }
                 }
@@ -1504,6 +1976,70 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         }
 
         return filtered;
+    }
+
+    private List<Detection> filterTactileRiskDetections(List<Detection> detections) {
+        List<Detection> filtered = new ArrayList<>();
+        float confidenceThreshold = Math.min(getDetectionThreshold(), TACTILE_OBSTACLE_SCORE_THRESHOLD);
+
+        for (Detection detection : detections) {
+            if (detection.confidence >= confidenceThreshold
+                    && riskLabels.contains(detection.label)
+                    && detection.centerX > 0.08f
+                    && detection.centerX < 0.92f) {
+                filtered.add(detection);
+            }
+        }
+
+        return filtered;
+    }
+
+    private void updateAutomaticGuidanceMode(List<Detection> brailleBlocks, long now) {
+        if (!navigationSessionActive) {
+            resetBrailleAutoState();
+            return;
+        }
+
+        if (!brailleBlocks.isEmpty()) {
+            brailleDetectionStreak += 1;
+            lastBrailleDetectedAt = now;
+
+            if (!"tactile".equals(guidanceMode) && brailleDetectionStreak >= BRAILLE_STABLE_DETECTION_COUNT) {
+                switchGuidanceModeAutomatically(
+                        "tactile",
+                        "점자블록이 탐지되었습니다. 스마트폰을 아래쪽으로 향해 주세요. 점자블록 위 장애물을 안내하겠습니다."
+                );
+            }
+
+            return;
+        }
+
+        brailleDetectionStreak = 0;
+
+        if ("tactile".equals(guidanceMode)
+                && lastBrailleDetectedAt > 0L
+                && now - lastBrailleDetectedAt >= BRAILLE_LOST_TIMEOUT_MS) {
+            switchGuidanceModeAutomatically(
+                    "general",
+                    "점자블록이 보이지 않습니다. 스마트폰을 정면으로 들어 주세요. 일반 전방 안내로 전환합니다."
+            );
+        }
+    }
+
+    private void switchGuidanceModeAutomatically(String mode, String message) {
+        guidanceMode = mode;
+        lastHazardKey = "";
+        lastGeneralHazardSpokenAt = 0L;
+        lastTactileDebugPostedAt = 0L;
+        lastSpokenAt = System.currentTimeMillis();
+        hazardSuppressedUntil = lastSpokenAt + 2500L;
+        updateGuide(message);
+        speak(message, true);
+    }
+
+    private void resetBrailleAutoState() {
+        brailleDetectionStreak = 0;
+        lastBrailleDetectedAt = 0L;
     }
 
     private String buildDetectionSummary(List<Detection> detections) {
@@ -1540,6 +2076,78 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 + "이 있습니다. 주의하세요.";
     }
 
+    private void speakGeneralHazards(List<Detection> riskDetections) {
+        long now = System.currentTimeMillis();
+
+        if (now < hazardSuppressedUntil) {
+            return;
+        }
+
+        if (now - lastGeneralHazardSpokenAt < GENERAL_HAZARD_SPEAK_INTERVAL_MS) {
+            return;
+        }
+
+        List<Detection> selected = selectGeneralHazards(riskDetections);
+
+        if (selected.isEmpty()) {
+            return;
+        }
+
+        String message = buildGeneralHazardMessage(selected);
+        lastGeneralHazardSpokenAt = now;
+        lastSpokenAt = now;
+        vibrateHazard();
+        updateGuide(message);
+        speak(message, true);
+    }
+
+    private List<Detection> selectGeneralHazards(List<Detection> riskDetections) {
+        List<Detection> selected = new ArrayList<>();
+        Set<String> usedLabels = new HashSet<>();
+
+        for (Detection detection : riskDetections) {
+            if (detection.area() < GENERAL_HAZARD_MIN_AREA) {
+                continue;
+            }
+
+            if (usedLabels.contains(detection.label)) {
+                continue;
+            }
+
+            selected.add(detection);
+            usedLabels.add(detection.label);
+
+            if (selected.size() >= 2) {
+                return selected;
+            }
+        }
+
+        if (selected.isEmpty() && !riskDetections.isEmpty()) {
+            selected.add(riskDetections.get(0));
+        }
+
+        return selected;
+    }
+
+    private String buildGeneralHazardMessage(List<Detection> selected) {
+        if (selected.size() == 1) {
+            return buildGuideMessage(selected.get(0));
+        }
+
+        StringBuilder builder = new StringBuilder("전방에 ");
+
+        for (int index = 0; index < selected.size(); index += 1) {
+            if (index > 0) {
+                builder.append(", ");
+            }
+
+            builder.append(toKoreanLabel(selected.get(index).label));
+        }
+
+        builder.append("가 보입니다. 주의하세요.");
+        return builder.toString();
+    }
+
     private void requestSceneGuidance(List<Detection> detections) {
         ServerClient.requestSceneGuidance(
                 getServerUrl(),
@@ -1561,7 +2169,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
     private boolean hasDetectedBrailleBlock(List<Detection> detections) {
         for (Detection detection : detections) {
-            if ("braille_block".equals(detection.label) && detection.confidence >= getDetectionThreshold()) {
+            if ("braille_block".equals(detection.label) && detection.confidence >= BRAILLE_DETECTION_THRESHOLD) {
                 return true;
             }
         }
@@ -1569,8 +2177,183 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         return false;
     }
 
+    private List<Detection> filterBrailleBlocks(List<Detection> detections) {
+        List<Detection> brailleBlocks = new ArrayList<>();
+
+        for (Detection detection : detections) {
+            if ("braille_block".equals(detection.label) && detection.confidence >= BRAILLE_DETECTION_THRESHOLD) {
+                brailleBlocks.add(detection);
+            }
+        }
+
+        return brailleBlocks;
+    }
+
+    private Detection findObstacleOnBrailleBlock(List<Detection> brailleBlocks, List<Detection> riskDetections) {
+        if (brailleBlocks.isEmpty()) {
+            return null;
+        }
+
+        for (Detection obstacle : riskDetections) {
+            if (!isTactileObstacleLabel(obstacle.label)) {
+                continue;
+            }
+
+            for (Detection brailleBlock : brailleBlocks) {
+                if (isTactileBlockingCandidate(obstacle, brailleBlock)) {
+                    return obstacle;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private boolean isTactileBlockingCandidate(Detection obstacle, Detection brailleBlock) {
+        if (calculateIou(obstacle, brailleBlock) >= TACTILE_IOU_THRESHOLD) {
+            return true;
+        }
+
+        if (isObstacleBottomCenterInsideExpandedBraille(obstacle, brailleBlock)) {
+            return true;
+        }
+
+        return calculateExpandedObstacleOverlap(obstacle, brailleBlock) >= TACTILE_EXPANDED_OBSTACLE_OVERLAP_THRESHOLD;
+    }
+
+    private float calculateMaxTactileIou(List<Detection> brailleBlocks, List<Detection> riskDetections) {
+        float maxIou = 0.0f;
+
+        for (Detection obstacle : riskDetections) {
+            if (!isTactileObstacleLabel(obstacle.label)) {
+                continue;
+            }
+
+            for (Detection brailleBlock : brailleBlocks) {
+                maxIou = Math.max(maxIou, calculateIou(obstacle, brailleBlock));
+            }
+        }
+
+        return maxIou;
+    }
+
+    private float calculateMaxExpandedObstacleOverlap(List<Detection> brailleBlocks, List<Detection> riskDetections) {
+        float maxOverlap = 0.0f;
+
+        for (Detection obstacle : riskDetections) {
+            if (!isTactileObstacleLabel(obstacle.label)) {
+                continue;
+            }
+
+            for (Detection brailleBlock : brailleBlocks) {
+                maxOverlap = Math.max(maxOverlap, calculateExpandedObstacleOverlap(obstacle, brailleBlock));
+            }
+        }
+
+        return maxOverlap;
+    }
+
+    private boolean isObstacleBottomCenterInsideExpandedBraille(Detection obstacle, Detection brailleBlock) {
+        float[] box = expandedBrailleBox(brailleBlock);
+        float bottomCenterX = obstacle.centerX;
+        float bottomCenterY = clamp(obstacle.centerY + obstacle.height / 2.0f, 0.0f, 1.0f);
+
+        return bottomCenterX >= box[0]
+                && bottomCenterX <= box[2]
+                && bottomCenterY >= box[1]
+                && bottomCenterY <= box[3];
+    }
+
+    private float calculateExpandedObstacleOverlap(Detection obstacle, Detection brailleBlock) {
+        float[] box = expandedBrailleBox(brailleBlock);
+        float obstacleLeft = obstacle.centerX - obstacle.width / 2.0f;
+        float obstacleTop = obstacle.centerY - obstacle.height / 2.0f;
+        float obstacleRight = obstacle.centerX + obstacle.width / 2.0f;
+        float obstacleBottom = obstacle.centerY + obstacle.height / 2.0f;
+
+        float intersectionLeft = Math.max(obstacleLeft, box[0]);
+        float intersectionTop = Math.max(obstacleTop, box[1]);
+        float intersectionRight = Math.min(obstacleRight, box[2]);
+        float intersectionBottom = Math.min(obstacleBottom, box[3]);
+        float intersectionWidth = Math.max(0.0f, intersectionRight - intersectionLeft);
+        float intersectionHeight = Math.max(0.0f, intersectionBottom - intersectionTop);
+        float intersectionArea = intersectionWidth * intersectionHeight;
+
+        if (obstacle.area() <= 0.0f) {
+            return 0.0f;
+        }
+
+        return intersectionArea / obstacle.area();
+    }
+
+    private float[] expandedBrailleBox(Detection brailleBlock) {
+        float halfWidth = Math.max(
+                brailleBlock.width * (0.5f + TACTILE_EXPAND_X_RATIO),
+                TACTILE_MIN_EXPANDED_HALF_WIDTH
+        );
+        float halfHeight = Math.max(
+                brailleBlock.height * (0.5f + TACTILE_EXPAND_Y_RATIO),
+                TACTILE_MIN_EXPANDED_HALF_HEIGHT
+        );
+
+        return new float[]{
+                clamp(brailleBlock.centerX - halfWidth, 0.0f, 1.0f),
+                clamp(brailleBlock.centerY - halfHeight, 0.0f, 1.0f),
+                clamp(brailleBlock.centerX + halfWidth, 0.0f, 1.0f),
+                clamp(brailleBlock.centerY + halfHeight, 0.0f, 1.0f)
+        };
+    }
+
+    private float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private boolean isTactileObstacleLabel(String label) {
+        return "person".equals(label)
+                || "bicycle".equals(label)
+                || "kickboard".equals(label)
+                || "motorcycle".equals(label)
+                || "car".equals(label)
+                || "bus".equals(label)
+                || "truck".equals(label)
+                || "bench".equals(label)
+                || "chair".equals(label)
+                || "backpack".equals(label)
+                || "handbag".equals(label)
+                || "suitcase".equals(label)
+                || "umbrella".equals(label)
+                || "skateboard".equals(label)
+                || "potted plant".equals(label);
+    }
+
+    private float calculateIou(Detection a, Detection b) {
+        float aLeft = a.centerX - a.width / 2.0f;
+        float aTop = a.centerY - a.height / 2.0f;
+        float aRight = a.centerX + a.width / 2.0f;
+        float aBottom = a.centerY + a.height / 2.0f;
+        float bLeft = b.centerX - b.width / 2.0f;
+        float bTop = b.centerY - b.height / 2.0f;
+        float bRight = b.centerX + b.width / 2.0f;
+        float bBottom = b.centerY + b.height / 2.0f;
+
+        float intersectionLeft = Math.max(aLeft, bLeft);
+        float intersectionTop = Math.max(aTop, bTop);
+        float intersectionRight = Math.min(aRight, bRight);
+        float intersectionBottom = Math.min(aBottom, bBottom);
+        float intersectionWidth = Math.max(0.0f, intersectionRight - intersectionLeft);
+        float intersectionHeight = Math.max(0.0f, intersectionBottom - intersectionTop);
+        float intersectionArea = intersectionWidth * intersectionHeight;
+        float unionArea = a.area() + b.area() - intersectionArea;
+
+        if (unionArea <= 0.0f) {
+            return 0.0f;
+        }
+
+        return intersectionArea / unionArea;
+    }
+
     private String buildTactileGuideMessage(Detection primary) {
-        return "점자블록 위에 "
+        return "점자블록 위 또는 근처에 "
                 + toKoreanLabel(primary.label)
                 + "로 보이는 장애물이 있습니다. 주의하세요.";
     }
@@ -1585,12 +2368,17 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 + guidanceMode;
         long now = System.currentTimeMillis();
 
+        if (now < hazardSuppressedUntil) {
+            return;
+        }
+
         if (key.equals(lastHazardKey) && now - lastHazardAlertAt < HAZARD_ALERT_COOLDOWN_MS) {
             return;
         }
 
         lastHazardKey = key;
         lastHazardAlertAt = now;
+        lastSpokenAt = now;
         vibrateHazard();
         updateGuide(message);
         speak(message, true);
@@ -1614,6 +2402,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
         lastHazardKey = key;
         lastHazardAlertAt = now;
+        lastSpokenAt = now;
 
         vibrateHazard();
         speak(message, true);
@@ -1666,7 +2455,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         Button emergencyButton = makeEmergencyButton("SOS  긴급 연락");
         emergencyButton.setOnClickListener(view -> {
             suppressHazardAlerts(5000L);
-            openGuardianSms();
+            requestEmergencySupport();
         });
         dialogRoot.addView(emergencyButton, matchWrap());
 
@@ -1688,60 +2477,64 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         hazardSuppressedUntil = System.currentTimeMillis() + durationMs;
     }
 
-    private boolean handleNavigationTouch(View view, MotionEvent event) {
-        if (navigationGestureDetector != null) {
-            navigationGestureDetector.onTouchEvent(event);
+    private void maybePostTactileDebug(
+            List<Detection> brailleBlocks,
+            List<Detection> riskDetections,
+            Detection tactileObstacle
+    ) {
+        long now = System.currentTimeMillis();
+
+        if (now - lastTactileDebugPostedAt < TACTILE_DEBUG_POST_INTERVAL_MS) {
+            return;
         }
-        return true;
-    }
 
-    private GestureDetector createNavigationGestureDetector() {
-        return new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
-            private static final int SWIPE_THRESHOLD = 90;
-            private static final int SWIPE_VELOCITY_THRESHOLD = 90;
+        boolean tactileModeActive = navigationSessionActive && "tactile".equals(guidanceMode);
 
-            @Override
-            public boolean onSingleTapConfirmed(MotionEvent event) {
-                speak(lastGuideMessage, true);
-                return true;
-            }
+        if (!tactileModeActive && brailleBlocks.isEmpty()) {
+            return;
+        }
 
-            @Override
-            public boolean onDoubleTap(MotionEvent event) {
-                speak("다음 안내입니다. " + nextPreviewMessage, true);
-                return true;
-            }
+        float maxIou = calculateMaxTactileIou(brailleBlocks, riskDetections);
+        float maxExpandedOverlap = calculateMaxExpandedObstacleOverlap(brailleBlocks, riskDetections);
+        String obstacleText = tactileObstacle == null ? "장애물 없음" : toKoreanLabel(tactileObstacle.label);
+        String message;
 
-            @Override
-            public boolean onFling(MotionEvent down, MotionEvent up, float velocityX, float velocityY) {
-                if (down == null || up == null) {
-                    return false;
-                }
+        if (brailleBlocks.isEmpty()) {
+            message = "점자블록 디버그: 점자블록 미감지";
+        } else {
+            message = "점자블록 디버그: 점자블록 "
+                    + brailleBlocks.size()
+                    + "개, 최대 IoU "
+                    + String.format(Locale.KOREA, "%.2f", maxIou)
+                    + ", 확장겹침 "
+                    + String.format(Locale.KOREA, "%.2f", maxExpandedOverlap)
+                    + ", "
+                    + obstacleText;
+        }
 
-                float diffX = up.getX() - down.getX();
-                float diffY = up.getY() - down.getY();
+        List<Detection> payload = new ArrayList<>();
 
-                if (Math.abs(diffX) > Math.abs(diffY)) {
-                    if (Math.abs(diffX) > SWIPE_THRESHOLD && Math.abs(velocityX) > SWIPE_VELOCITY_THRESHOLD) {
-                        if (diffX > 0) {
-                            readRiskInformation();
-                        } else {
-                            readNearbyPlaces("");
-                        }
-                        return true;
-                    }
-                } else if (Math.abs(diffY) > SWIPE_THRESHOLD && Math.abs(velocityY) > SWIPE_VELOCITY_THRESHOLD) {
-                    if (diffY > 0) {
-                        speak("현재 위치는 " + getLocationSpeechText(), true);
-                    } else {
-                        speak("진행 방향입니다. " + lastGuideMessage, true);
-                    }
-                    return true;
-                }
+        if (!brailleBlocks.isEmpty()) {
+            payload.add(brailleBlocks.get(0));
+        }
 
-                return false;
-            }
-        });
+        if (tactileObstacle != null) {
+            payload.add(tactileObstacle);
+        } else if (!riskDetections.isEmpty()) {
+            payload.add(riskDetections.get(0));
+        }
+
+        lastTactileDebugPostedAt = now;
+        ServerClient.postDetection(
+                getServerUrl(),
+                DEVICE_ID,
+                currentLat,
+                currentLng,
+                currentHeading,
+                payload,
+                message,
+                result -> runOnUiThread(() -> setServerStatus(result))
+        );
     }
 
     private void maybePostDetection(List<Detection> riskDetections, String message) {
@@ -1889,6 +2682,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             return;
         }
 
+        if (flush) {
+            stopListeningImmediately();
+        }
+
         int queueMode = flush ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD;
         tts.speak(message, queueMode, null, "a-eye-guide");
     }
@@ -2008,13 +2805,9 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 if (pendingVoiceCommandAfterPermission) {
                     pendingVoiceCommandAfterPermission = false;
                     startWakeListening();
-                } else {
-                    pendingDestinationSpeechAfterPermission = false;
-                    startWakeListening();
                 }
             } else {
                 pendingVoiceCommandAfterPermission = false;
-                pendingDestinationSpeechAfterPermission = false;
                 updateGuide("음성 입력 권한이 필요합니다.");
             }
         }
@@ -2243,17 +3036,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         return textView;
     }
 
-    private TextView makeChip(String text) {
-        TextView textView = new TextView(this);
-        textView.setText(text);
-        textView.setTextColor(COLOR_MUTED);
-        textView.setTextSize(16);
-        textView.setGravity(Gravity.CENTER);
-        textView.setPadding(dp(16), dp(10), dp(16), dp(10));
-        textView.setBackground(makeRoundedDrawable(COLOR_SURFACE_ALT, COLOR_BORDER, dp(24)));
-        return textView;
-    }
-
     private TextView makePanelText(String text, int textSize, int textColor) {
         TextView textView = new TextView(this);
         textView.setText(text);
@@ -2300,23 +3082,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         button.setBackground(makeRoundedDrawable(backgroundColor, backgroundColor, dp(12)));
         button.setAllCaps(false);
         button.setMinHeight(dp(72));
-        return button;
-    }
-
-    private Button makeTileButton(String text) {
-        Button button = makeButton(text, COLOR_SURFACE_ALT, COLOR_TEXT);
-        button.setTextSize(18);
-        button.setMinHeight(dp(112));
-        button.setBackground(makeRoundedDrawable(COLOR_SURFACE_ALT, COLOR_BORDER, dp(14)));
-        return button;
-    }
-
-    private Button makeListButton(String text) {
-        Button button = makeButton(text, COLOR_SURFACE, COLOR_TEXT);
-        button.setTextSize(17);
-        button.setGravity(Gravity.CENTER_VERTICAL);
-        button.setPadding(dp(18), dp(10), dp(18), dp(10));
-        button.setBackground(makeRoundedDrawable(COLOR_SURFACE, COLOR_SURFACE, dp(10)));
         return button;
     }
 
@@ -2422,16 +3187,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
         );
-    }
-
-    private LinearLayout.LayoutParams weightedButtonParams(float weight, int left, int top, int right, int bottom) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                weight
-        );
-        params.setMargins(dp(left), dp(top), dp(right), dp(bottom));
-        return params;
     }
 
     private LinearLayout.LayoutParams margin(LinearLayout.LayoutParams params, int left, int top, int right, int bottom) {

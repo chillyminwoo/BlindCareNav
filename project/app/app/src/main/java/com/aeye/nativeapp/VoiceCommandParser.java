@@ -11,63 +11,32 @@ public class VoiceCommandParser {
             return unknown(raw);
         }
 
-        if (containsAny(normalized, "긴급", "보호자", "도와줘", "살려줘", "sos")) {
+        if (containsAny(normalized, "도움", "도와줘", "도와주세요", "길막힘", "막혔어", "장애물치워")) {
+            return new VoiceCommand(VoiceCommand.IntentType.HELP, raw, "", "");
+        }
+
+        if (containsAny(normalized, "긴급", "보호자", "살려줘", "다쳤어", "119", "sos")) {
             return new VoiceCommand(VoiceCommand.IntentType.EMERGENCY, raw, "", "");
         }
 
-        if (containsAny(normalized, "스트리밍중지", "스트리밍꺼", "스트리밍모드꺼", "카메라중지", "영상중지", "화면전송중지")) {
-            return new VoiceCommand(VoiceCommand.IntentType.STOP_STREAMING, raw, "", "");
-        }
-
-        if (containsAny(normalized, "스트리밍시작", "스트리밍켜", "스트리밍모드켜", "카메라스트리밍", "영상전송", "화면전송", "관제전송")) {
-            return new VoiceCommand(VoiceCommand.IntentType.START_STREAMING, raw, "", "");
-        }
-
-        if (containsAny(normalized, "다시", "반복", "한번더", "한번더말", "또말", "재생", "다시읽어")) {
+        if (containsAny(normalized, "반복", "한번더", "한번더말", "또말", "재생", "다시읽어")) {
             return new VoiceCommand(VoiceCommand.IntentType.REPEAT_GUIDANCE, raw, "", "");
         }
 
-        if (containsAny(normalized, "다음", "미리", "다음안내", "다음길")) {
+        if (containsAny(normalized, "다음안내", "다음길")) {
             return new VoiceCommand(VoiceCommand.IntentType.NEXT_GUIDANCE, raw, "", "");
         }
 
-        if (containsAny(normalized, "안내종료", "길안내종료", "종료", "그만", "멈춰", "중지", "네비종료", "내비종료")) {
+        if (containsAny(normalized, "안내종료", "길안내종료", "그만", "멈춰", "중지", "네비종료", "내비종료")) {
             return new VoiceCommand(VoiceCommand.IntentType.STOP_NAVIGATION, raw, "", "");
         }
 
-        if (containsAny(normalized, "현재위치", "내위치", "여기어디", "어디야", "위치알려", "위치말해")) {
+        if (containsAny(normalized, "현재위치", "내위치", "여기어디", "위치알려", "위치말해")) {
             return new VoiceCommand(VoiceCommand.IntentType.CURRENT_LOCATION, raw, "", "");
         }
 
         if (containsAny(normalized, "설정", "서버주소", "보호자번호", "tts")) {
             return new VoiceCommand(VoiceCommand.IntentType.OPEN_SETTINGS, raw, "", "");
-        }
-
-        if (containsAny(normalized, "즐겨찾기저장", "현재목적지저장", "목적지저장", "저장해줘")) {
-            return new VoiceCommand(VoiceCommand.IntentType.SAVE_FAVORITE, raw, "", "");
-        }
-
-        if (containsAny(normalized, "최근목적지", "최근경로", "최근장소", "방금목적지")) {
-            return new VoiceCommand(VoiceCommand.IntentType.RECENT_DESTINATION, raw, "", "");
-        }
-
-        if (containsAny(normalized, "즐겨찾기", "저장한곳", "저장장소")) {
-            return new VoiceCommand(VoiceCommand.IntentType.FAVORITE, raw, "", "");
-        }
-
-        if (containsAny(normalized, "위험", "위험정보", "주의", "위험지점", "장애물정보", "위험알려", "장애물알려")) {
-            return new VoiceCommand(VoiceCommand.IntentType.RISK_INFO, raw, "", "");
-        }
-
-        if (containsAny(normalized, "주변", "근처", "가까운", "가까이", "어디있어")) {
-            return new VoiceCommand(VoiceCommand.IntentType.NEARBY, raw, "", parsePlaceType(normalized));
-        }
-
-        String destination = extractDestination(raw);
-        String normalizedDestination = normalize(destination);
-
-        if (destination.length() >= 2 && looksLikeDestination(normalized, normalizedDestination)) {
-            return new VoiceCommand(VoiceCommand.IntentType.NAVIGATE, raw, destination, "");
         }
 
         return unknown(raw);
@@ -179,30 +148,19 @@ public class VoiceCommandParser {
     }
 
     private static boolean looksLikeDestination(String normalizedRaw, String normalizedDestination) {
-        if (containsAny(normalizedRaw, "안내", "길", "경로", "찾아", "가줘", "가자")) {
+        if (containsAny(normalizedRaw, "안내", "길", "경로", "찾아", "가줘", "가자", "가고싶어")) {
+            return true;
+        }
+
+        // 시범 구역 주요 목적지 화이트리스트
+        if (containsAny(normalizedDestination, 
+                "화곡역", "연세의원", "본동시장", "화곡초등학교", "볏골공원", "나누리병원")) {
             return true;
         }
 
         return containsAny(
                 normalizedDestination,
-                "역",
-                "출구",
-                "정문",
-                "후문",
-                "학교",
-                "병원",
-                "센터",
-                "주민센터",
-                "공원",
-                "시장",
-                "교차로",
-                "사거리",
-                "카페",
-                "편의점",
-                "마트",
-                "약국",
-                "구청",
-                "동사무소"
+                "역", "출구", "정문", "후문", "학교", "병원", "센터", "주민센터", "공원", "시장", "교차로", "사거리", "카페", "편의점", "마트", "약국", "구청", "동사무소"
         );
     }
 
