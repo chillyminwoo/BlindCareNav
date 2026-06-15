@@ -152,6 +152,11 @@ export default function App() {
   const canvasRef             = useRef(null);
   const mjpegAbortRef         = useRef(null);
   const streamLogRef          = useRef("대기 중");
+  const [panelWidth, setPanelWidth] = useState(380);
+  const panelWidthRef = useRef(380);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
 
   const [status,          setStatus         ] = useState("관제 웹을 준비하고 있습니다.");
   const [currentPosition, setCurrentPosition] = useState(DEFAULT_POSITION);
@@ -277,6 +282,45 @@ export default function App() {
       }
     })();
   }, [stopMjpeg]);
+  const handleSearch = useCallback(async () => {
+  if (!searchQuery.trim()) return;
+  setIsSearching(true);
+  setSearchResults([]);
+  try {
+    const pos = currentPosRef.current;
+    const q = new URLSearchParams({
+      query: searchQuery,
+      x: String(pos.lng),
+      y: String(pos.lat),
+      radius: "5000",
+      sort: "distance",
+      size: "5",
+    });
+    const res = await fetch(`https://dapi.kakao.com/v2/local/search/keyword.json?${q}`, {
+      headers: { Authorization: `KakaoAK ${KAKAO_REST_KEY}` },
+    });
+    const data = await res.json();
+    setSearchResults(data.documents || []);
+  } catch (err) {
+    console.warn("검색 실패", err);
+  } finally {
+    setIsSearching(false);
+  }
+}, [searchQuery]);
+
+const handleSelectResult = useCallback((item) => {
+  const point = { lat: Number(item.y), lng: Number(item.x) };
+  const name = item.place_name;
+  setSearchResults([]);
+  setSearchQuery("");
+  destinationNameRef.current = name;
+  fetch(apiUrl("/api/set_destination"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ area: "hwagok", destination: name, ...point, source: "control-web", mode: "navigation" }),
+  }).catch(() => {});
+  if (calculateAndDrawRouteRef.current) calculateAndDrawRouteRef.current(point, name);
+}, []);
 
 // 변경 후
 const updateLocationOverlay = useCallback((point) => {
@@ -531,6 +575,25 @@ const updateLocationOverlay = useCallback((point) => {
     }
   }, [clearMapObjects]);
 
+  // 바로 아래에 추가
+const handlePanelResize = useCallback((e) => {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startWidth = panelWidthRef.current;
+  const onMouseMove = (moveEvent) => {
+    const delta = startX - moveEvent.clientX;
+    const newWidth = Math.min(600, Math.max(280, startWidth + delta));
+    panelWidthRef.current = newWidth;
+    setPanelWidth(newWidth);
+  };
+  const onMouseUp = () => {
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", onMouseUp);
+  };
+  window.addEventListener("mousemove", onMouseMove);
+  window.addEventListener("mouseup", onMouseUp);
+}, []);
+
   // ── 스트리밍 시작/중지 ─────────────────────────────────
   const handleStreamRequest = useCallback(async (start) => {
     const path = start ? "/api/control/stream/start" : "/api/control/stream/stop";
@@ -770,21 +833,83 @@ if (hzd)  {
   const isStreamActive  = streamUiInfo.active;
   const isStreamPending = streamUiInfo.requested && !streamUiInfo.active;
 
-  return (
+return (
     <div className="control-shell" style={{ position:"relative", width:"100vw", height:"100vh", overflow:"hidden" }}>
       <div ref={mapDivRef} className="map" style={{ width:"100%", height:"100%", position:"absolute", top:0, left:0, zIndex:1 }} />
 
-      <aside className="panel" style={{ position:"absolute", top:"20px", right:"20px", zIndex:10, maxHeight:"calc(100vh - 40px)", overflowY:"auto" }}>
-        <div>
-          <p className="eyebrow">누니 관제 웹</p>
-          <h1>화곡 시범구역</h1>
-          <p className="status">{status}</p>
+      {/* ── 검색창 ── */}
+      <div style={{
+        position: "absolute", top: "20px", left: "20px", zIndex: 10,
+        width: "300px", display: "flex", flexDirection: "column", gap: "6px",
+      }}>
+        <div style={{ display: "flex", gap: "6px" }}>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+            placeholder="장소 검색 (예: 화곡3동 주민센터)"
+            style={{
+              flex: 1, padding: "10px 14px", borderRadius: "8px",
+              border: "none", fontSize: "13px",
+              background: "rgba(15,15,15,0.92)", color: "white",
+              outline: "none", boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+            }}
+          />
+          <button
+            type="button"
+            onClick={handleSearch}
+            disabled={isSearching}
+            style={{
+              padding: "10px 14px", borderRadius: "8px", border: "none",
+              background: "#2563EB", color: "white", fontWeight: "bold",
+              cursor: isSearching ? "not-allowed" : "pointer", fontSize: "13px",
+              boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+            }}
+          >
+            {isSearching ? "⏳" : "🔍"}
+          </button>
         </div>
-        <div className="metrics">
-          <div><span>점자블록</span><strong>{summary?.tactileBlockCount ?? "-"}</strong></div>
-          <div><span>위험 지점</span><strong>{summary?.riskCount ?? "-"}</strong></div>
-          <div><span>점자 장애물</span><strong>{summary?.tactileHazardCount ?? "-"}</strong></div>
-          <div><span>긴급 호출</span><strong>{summary?.mobileEmergencyLogCount ?? "-"}</strong></div>
+
+        {searchResults.length > 0 && (
+          <div style={{
+            background: "rgba(15,15,15,0.95)", borderRadius: "8px",
+            overflow: "hidden", boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+          }}>
+            {searchResults.map((item) => (
+              <div
+                key={item.id}
+                onClick={() => handleSelectResult(item)}
+                style={{
+                  padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #1f2937",
+                  transition: "background 0.15s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+              >
+                <div style={{ fontWeight: "bold", fontSize: "13px", color: "white" }}>{item.place_name}</div>
+                <div style={{ fontSize: "11px", color: "#9ca3af", marginTop: "2px" }}>{item.address_name}</div>
+                <div style={{ fontSize: "11px", color: "#6b7280", marginTop: "1px" }}>{item.category_name}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <aside className="panel" style={{ position:"absolute", top:"20px", right:"20px", zIndex:10, maxHeight:"calc(100vh - 40px)", overflowY:"auto", width:`${panelWidth}px`, minWidth:"280px" }}>
+
+        {/* 리사이즈 핸들 */}
+        <div
+          onMouseDown={handlePanelResize}
+          style={{ position:"absolute", left:0, top:0, width:"6px", height:"100%", cursor:"ew-resize", zIndex:20, borderRadius:"4px 0 0 4px", background:"transparent", transition:"background 0.15s" }}
+          onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.4)"}
+          onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+        />
+
+        <div>
+          <p className="eyebrow">화곡 시범구역</p>
+          <h1>누니 관제 웹</h1>
+          <p className="status">{status}</p>
         </div>
 
         {/* ── 마커 초기화 버튼 ── */}
@@ -809,41 +934,10 @@ if (hzd)  {
 
         <section>
           <div className="section-title"><h2>현재 위치</h2></div>
-          <div style={{ display:"flex", gap:"6px", marginBottom:"8px" }}>
-            <button
-              type="button"
-              onClick={() => setLocMode("mobile")}
-              style={{
-                flex:1, padding:"6px 8px", borderRadius:"6px", fontSize:"11px",
-                fontWeight:"bold", cursor:"pointer", border:"none",
-                background: locMode === "mobile" ? "#2563EB" : "#1f2937",
-                color: locMode === "mobile" ? "white" : "#9ca3af",
-              }}
-            >
-              📱 앱 GPS
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setLocMode("browser");
-                updateOverlayRef.current(currentPosRef.current, headingRef.current);
-              }}
-              style={{
-                flex:1, padding:"6px 8px", borderRadius:"6px", fontSize:"11px",
-                fontWeight:"bold", cursor:"pointer", border:"none",
-                background: locMode === "browser" ? "#2563EB" : "#1f2937",
-                color: locMode === "browser" ? "white" : "#9ca3af",
-              }}
-            >
-              💻 노트북 GPS
-            </button>
-          </div>
           <p className="plain" style={{ fontSize:"11px", opacity:0.7 }}>
-            {locMode === "mobile"
-              ? mobilePosRef.current
-                ? `앱 위치: ${mobilePosRef.current.lat.toFixed(5)}, ${mobilePosRef.current.lng.toFixed(5)}`
-                : "앱 위치 수신 대기 중... (앱 실행 후 표시)"
-              : `노트북: ${currentPosition.lat.toFixed(5)}, ${currentPosition.lng.toFixed(5)}`}
+            {mobilePosRef.current
+              ? `앱 위치: ${mobilePosRef.current.lat.toFixed(5)}, ${mobilePosRef.current.lng.toFixed(5)}`
+              : "앱 위치 수신 대기 중... (앱 실행 후 표시)"}
           </p>
         </section>
 
