@@ -4,6 +4,10 @@
 점자블록 중심의 경로 안내와 실시간 장애물 탐지, 그리고 위급 상황 관제 시스템을 하나로 통합했습니다.
 
 ---
+## 시연 영상
+
+[![시연 영상](https://img.youtube.com/vi/Thl4TOxhN7w/maxresdefault.jpg)](https://youtu.be/Thl4TOxhN7w)
+---
 
 ## 📌 1. 프로젝트 개요 (Overview)
 
